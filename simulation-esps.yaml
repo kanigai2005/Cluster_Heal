@@ -1,0 +1,84 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: esp-watersensor
+  namespace: campus-water
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+         app: water-esp
+  template:
+    metadata:
+      labels:
+        app: water-esp
+    spec:
+      containers:
+      - name: water-simulator
+        image: alpine:latest
+        command: ["/bin/sh","-c"]
+        args:
+          - |
+            echo "Starting Water ESP Simulation...";
+            while true; do
+              dd if=/dev/urandom of=/tmp/valve_stress_test bs=1M count=50 conv=fdatasync;
+              rm -f /tmp/valve_stress_test;
+              sleep 1;
+            done;
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: esp-traffic-camera
+  namespace: town-traffic
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: traffic-esp
+  template:
+    metadata:
+      labels:
+        app: traffic-esp
+    spec:
+      containers:
+      - name: traffic-simulator
+        image: alpine:latest
+        # PROBLEM SIMULATION: This loop forces a mathematical calculation (md5 hashing)
+        # to run continuously, driving the CPU and Memory high to simulate processing video.
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            echo "Starting Traffic ESP Simulation...";
+            while true; do
+              md5sum /dev/urandom;
+            done;
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: esp-smart-kitchen
+  namespace: kitchen-traffic
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kitchen-esp
+  template:
+    metadata:
+      labels:
+        app: kitchen-esp
+    spec:
+      containers:
+      - name: kitchen-simulator
+        image: alpine:latest
+        # PROBLEM SIMULATION: This loop forces a mathematical calculation (md5 hashing)
+        # to run continuously, driving the CPU and Memory high to simulate processing video.
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            echo "Starting Traffic ESP Simulation...";
+            while true; do
+              md5sum /dev/urandom;
+            done;
