@@ -1,29 +1,28 @@
-# config.py - Central configuration
 import os
-from dataclasses import dataclass
 
-@dataclass
-class Config:
-    # Prometheus
-    prometheus_url: str = "http://localhost:9090"
-    prometheus_timeout: int = 5
-    
-    # Kafka
-    kafka_bootstrap_servers: str = "localhost:9092"
-    kafka_topic_metrics: str = "sre-metrics"
-    kafka_topic_alerts: str = "sre-alerts"
-    kafka_consumer_group: str = "sre-group"
-    
-    # LLM
-    groq_api_key: str = os.environ.get("GROQ_API_KEY", "")
-    groq_model: str = "llama-3.1-8b-instant"
-    
-    # Monitoring
-    refresh_interval: int = 5
-    anomaly_threshold: float = 0.7
-    
-    # Streaming
-    kafka_enabled: bool = True  # Set False to disable Kafka
-    metric_change_threshold: float = 0.05  # 5% change triggers update
+# Site Reliability Engineering Configuration Parameters
 
-config = Config()
+# Gemini / Groq API Configuration
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+
+# Kafka Broking Server Setup
+KAFKA_BOOTSTRAP_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+KAFKA_TOPIC_TELEMETRY = "sre-pod-telemetry"
+KAFKA_TOPIC_ANOMALIES = "sre-pod-anomalies"
+
+# Prometheus Scraper Configurations
+PROMETHEUS_URL = os.environ.get("PROMETHEUS_URL", "http://localhost:9090")
+SCRAPE_INTERVAL_SECONDS = 3.0
+
+# Q-Learning Hyperparameters
+RL_LEARNING_RATE = 0.2
+RL_DISCOUNT_FACTOR = 0.8
+RL_INITIAL_EPSILON = 0.3
+RL_DECAY_RATE = 0.01
+
+# SRE Thresholds
+CPU_WARNING_THRESHOLD_PCT = 70.0
+CPU_CRITICAL_THRESHOLD_PCT = 90.0
+MEM_WARNING_THRESHOLD_PCT = 70.0
+MEM_CRITICAL_THRESHOLD_PCT = 90.0
+ANOMALY_SCORE_THRESHOLD = -0.5

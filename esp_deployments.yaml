@@ -1,23 +1,10 @@
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: town-traffic
----
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: campus-water
----
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: kitchen-traffic
----
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: esp-traffic-camera
   namespace: town-traffic
+  labels:
+    app: esp-traffic-camera
 spec:
   replicas: 1
   selector:
@@ -29,20 +16,25 @@ spec:
         app: esp-traffic-camera
     spec:
       containers:
-      - name: app
-        image: busybox
-        command: ["sh", "-c"]
-        args: ["while true; do echo 'CPU work'; i=0; while [ $i -lt 1000000 ]; do i=$((i+1)); done; sleep 1; done"]
-        resources:
-          requests:
-            cpu: "200m"
-            memory: "256Mi"
+        - name: traffic-camera
+          image: custom/esp-traffic-camera:v1.3.4
+          resources:
+            limits:
+              cpu: "4"
+              memory: "512Mi"
+            requests:
+              cpu: "1"
+              memory: "256Mi"
+          ports:
+            - containerPort: 8080
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: esp-water-sensor
   namespace: campus-water
+  labels:
+    app: esp-water-sensor
 spec:
   replicas: 1
   selector:
@@ -54,20 +46,23 @@ spec:
         app: esp-water-sensor
     spec:
       containers:
-      - name: app
-        image: busybox
-        command: ["sh", "-c"]
-        args: ["while true; do dd if=/dev/zero of=/tmp/io bs=1M count=10 2>/dev/null; sleep 2; done"]
-        resources:
-          requests:
-            cpu: "100m"
-            memory: "128Mi"
+        - name: water-polling
+          image: custom/esp-water-sensor:v1.0.1
+          resources:
+            limits:
+              cpu: "2"
+              memory: "256Mi"
+            requests:
+              cpu: "500m"
+              memory: "128Mi"
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: esp-smart-kitchen
   namespace: kitchen-traffic
+  labels:
+    app: esp-smart-kitchen
 spec:
   replicas: 1
   selector:
@@ -79,11 +74,12 @@ spec:
         app: esp-smart-kitchen
     spec:
       containers:
-      - name: app
-        image: busybox
-        command: ["sh", "-c"]
-        args: ["while true; do 'echo memory work'; sleep 1; done"]
-        resources:
-          requests:
-            cpu: "150m"
-            memory: "192Mi"
+        - name: kitchen-hub
+          image: custom/esp-kitchen-hub:v2.1.0
+          resources:
+            limits:
+              cpu: "2"
+              memory: "512Mi"
+            requests:
+              cpu: "500m"
+              memory: "256Mi"

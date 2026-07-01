@@ -1,34 +1,47 @@
-from pydantic import BaseModel
-from typing import List, Optional, Dict
-from datetime import datetime
+from pydantic import BaseModel, Field
+from typing import List, Optional
 
-class PodInfo(BaseModel):
+class ProcessDetail(BaseModel):
+    pid: int
+    user: str
+    cpu: float
+    mem: float
+    command: str
+
+class PodTelemetry(BaseModel):
     name: str
     namespace: str
-    node: str
-    status: str
+    deployment: str
+    cpu_cores_used: float
+    cpu_pct: float
+    cpu_limit_cores: float
+    memory_mb_used: float
+    memory_limit_mb: float
     restarts: int
-    labels: Dict[str, str]
+    status: str  # HEALTHY, WARNING, CRITICAL
+    replicas: int
+    is_anomaly: bool = False
+    anomaly_score: float = 0.0
+    creation_time_ms: int
+    active_processes: List[ProcessDetail] = Field(default_factory=list)
+    timestamp_ms: int
 
-class MetricEvent(BaseModel):
-    timestamp: float
-    pod_key: str
-    namespace: str
+class AnomalyReport(BaseModel):
     pod_name: str
-    cpu: float
-    memory_mb: float
-    io_kbps: float
-    node: str
+    deployment: str
+    metric_type: str  # CPU, MEMORY, PROCESS
+    anomaly_score: float
+    timestamp_ms: int
+    details: str
 
-class AnomalyEvent(BaseModel):
-    timestamp: float
-    pod_key: str
-    severity: str
+class RemediationAction(BaseModel):
+    id: str
+    timestamp: str
+    pod_name: str
+    namespace: str
+    action: str  # scale_up, scale_down, restart, delete_pod, kill_process, do_nothing
+    status: str  # SUCCESS, FAILED
     message: str
-    current_cpu: float
-    current_memory_mb: float
-
-class RemediationCommand(BaseModel):
-    command: str
-    reason: str
-    risk_level: str
+    triggered_by: str  # MANUAL, RL_AGENT
+    reward: float
+    notes: Optional[str] = None
