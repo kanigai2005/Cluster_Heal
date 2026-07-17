@@ -8,19 +8,13 @@ from typing import List, Dict
 
 class ClusterDiscoveryEngine:
     """
-    Automated discovery engine that sweeps both real docker containers,
+    Automated discovery engine that sweeps both real Kubernetes pods,
     system host processes, and active background threads.
     """
     def __init__(self):
-        # Check if docker CLI is available and daemon is actually running/responding
+        # Explicitly set to False as requested by the user, prioritizing kubectl and Kubernetes-native discovery over Docker CLI
         self.is_docker_available = False
-        if shutil.which("docker") is not None:
-            try:
-                res = subprocess.run(["docker", "info"], capture_output=True, text=True, timeout=0.5)
-                if res.returncode == 0:
-                    self.is_docker_available = True
-            except Exception:
-                self.is_docker_available = False
+        self.is_k8s_available = shutil.which("kubectl") is not None
         
         # Caching layer to improve Streamlit UI performance and responsiveness
         self._cached_pods = []
@@ -36,16 +30,66 @@ class ClusterDiscoveryEngine:
         chars = 'abcdefghijklmnopqrstuvwxyz0123456789'
         return f"{''.join(random.choice(chars) for _ in range(5))}-{''.join(random.choice(chars) for _ in range(3))}"
 
+    def is_infra_pod(self, name: str, namespace: str) -> bool:
+        if not name or not namespace:
+            return False
+        name_lower = name.lower()
+        ns_lower = namespace.lower()
+        
+        # Exclude system namespaces completely
+        if ns_lower in ["kube-system", "kube-public", "kube-node-lease", "local-path-storage", "ingress-nginx", "metallb-system"]:
+            return True
+            
+        # Exclude common system/infrastructure apps in the cluster
+        infra_keywords = [
+            "prometheus", "sre-kafka", "kafka", "zookeeper", "alertmanager", "node-exporter",
+            "pushgateway", "kube-state-metrics", "kafka-adapter", "coredns", "kube-proxy",
+            "kube-apiserver", "kube-controller-manager", "kube-scheduler", "etcd", "kindest", "minikube"
+        ]
+        if any(kw in name_lower for kw in infra_keywords):
+            return True
+            
+        return False
+
     def scrape_docker_containers(self) -> List[Dict]:
-        """Runs 'docker ps' to discover actual containers running."""
-        if not self.is_docker_available:
+        """Runs 'kubectl' to discover actual running containers."""
+        if not self.is_k8s_available:
             return []
         try:
-            cmd = ["docker", "ps", "-a", "--format", "{{.ID}}|{{.Names}}|{{.Image}}|{{.Status}}"]
+            cmd = [
+                "kubectl",
+                "get",
+                "pods",
+                "-A",
+                "-o",
+                "go-template={{range .items}}{{.metadata.namespace}}|{{.metadata.name}}|{{range .spec.containers}}{{.image}},{{end}}|{{.status.phase}}{{\"\n\"}}{{end}}",
+            ]
+
             res = subprocess.run(cmd, capture_output=True, text=True, timeout=2)
             if res.returncode != 0:
-                return []
-            
+                # Fallback to standard kubectl get pods if go-template is not fully available
+                cmd = ["kubectl", "get", "pods"]
+                res = subprocess.run(cmd, capture_output=True, text=True, timeout=2)
+                if res.returncode != 0:
+                    return []
+                containers = []
+                for line in res.stdout.strip().split("\n"):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        ns, name, status = parts[0], parts[1], parts[2]
+                        if self.is_infra_pod(name, ns):
+                            continue
+                        containers.append({
+                            "id": name,
+                            "name": name,
+                            "image": "k8s-image:latest",
+                            "status": status
+                        })
+                return containers
+
             containers = []
             for line in res.stdout.strip().split("\n"):
                 line = line.strip()
@@ -53,22 +97,25 @@ class ClusterDiscoveryEngine:
                     continue
                 parts = line.split("|")
                 if len(parts) >= 4:
+                    ns, name, image, status = parts[0], parts[1], parts[2], parts[3]
+                    if self.is_infra_pod(name, ns):
+                        continue
                     containers.append({
-                        "id": parts[0],
-                        "name": parts[1],
-                        "image": parts[2],
-                        "status": parts[3]
+                        "id": name,
+                        "name": name,
+                        "image": image.rstrip(","),
+                        "status": status
                     })
             return containers
         except Exception:
             return []
 
     def scrape_docker_stats(self) -> Dict[str, Dict]:
-        """Runs 'docker stats' to get actual real-time CPU & Memory of containers."""
-        if not self.is_docker_available:
+        """Runs 'kubectl top pods' to get actual real-time CPU & Memory of containers."""
+        if not self.is_k8s_available:
             return {}
         try:
-            cmd = ["docker", "stats", "--no-stream", "--format", "{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}"]
+            cmd = ["kubectl", "top", "pods", "-A", "--no-headers"]
             res = subprocess.run(cmd, capture_output=True, text=True, timeout=2)
             if res.returncode != 0:
                 return {}
@@ -78,41 +125,39 @@ class ClusterDiscoveryEngine:
                 line = line.strip()
                 if not line:
                     continue
-                parts = line.split("|")
-                if len(parts) >= 3:
-                    name, cpu_str, mem_str = parts[0], parts[1], parts[2]
+                parts = line.split()
+                if len(parts) >= 4:
+                    ns, name, cpu_str, mem_str = parts[0], parts[1], parts[2], parts[3]
+                    
+                    if self.is_infra_pod(name, ns):
+                        continue
                     
                     try:
-                        cpu_pct = float(cpu_str.replace("%", "").strip())
+                        if cpu_str.endswith("m"):
+                            cpu_cores = float(cpu_str.replace("m", "")) / 1000.0
+                        else:
+                            cpu_cores = float(cpu_str)
+                        cpu_pct = (cpu_cores / 4.0) * 100.0
                     except ValueError:
                         cpu_pct = 2.0
                     
                     mem_mb = 25.0
-                    mem_limit = 512.0
-                    if "/" in mem_str:
-                        parts_mem = mem_str.split("/")
-                        u_str, l_str = parts_mem[0].strip(), parts_mem[1].strip()
+                    mem_limit = 1024.0
+                    try:
+                        if mem_str.endswith("Mi"):
+                            mem_mb = float(mem_str.replace("Mi", ""))
+                        elif mem_str.endswith("Gi"):
+                            mem_mb = float(mem_str.replace("Gi", "")) * 1024.0
+                        elif mem_str.endswith("Ki"):
+                            mem_mb = float(mem_str.replace("Ki", "")) / 1024.0
+                        else:
+                            mem_mb = float(mem_str)
+                    except ValueError:
+                        mem_mb = 25.0
                         
-                        def to_mb(s: str) -> float:
-                            s_clean = s.lower()
-                            if "gib" in s_clean:
-                                return float(s_clean.replace("gib", "").strip()) * 1024.0
-                            if "mib" in s_clean:
-                                return float(s_clean.replace("mib", "").strip())
-                            if "kib" in s_clean:
-                                return float(s_clean.replace("kib", "").strip()) / 1024.0
-                            if "b" in s_clean:
-                                return float(s_clean.replace("b", "").strip()) / (1024.0 * 1024.0)
-                            return 25.0
-                        
-                        try:
-                            mem_mb = to_mb(u_str)
-                            mem_limit = to_mb(l_str)
-                        except Exception:
-                            pass
                     stats[name] = {
-                        "cpu_pct": cpu_pct,
-                        "memory_mb": mem_mb,
+                        "cpu_pct": round(cpu_pct, 1),
+                        "memory_mb": round(mem_mb, 1),
                         "memory_limit": mem_limit
                     }
             return stats
@@ -120,15 +165,61 @@ class ClusterDiscoveryEngine:
             return {}
 
     def scrape_container_processes(self, container_name: str) -> List[Dict]:
-        """Runs 'docker top' to scrape running processes inside a container."""
-        if not self.is_docker_available:
+        """Runs kubectl exec to scrape running processes inside a container."""
+        if not self.is_k8s_available:
             return []
+
         try:
-            cmd = ["docker", "top", container_name]
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=2)
+            # Step 1: Find the pod name using the container name
+            find_pod_cmd = [
+                "kubectl",
+                "get",
+                "pods",
+                "-A",
+                "-o",
+                "jsonpath={range .items[*]}{.metadata.namespace}{' '}{.metadata.name}{' '}{range .spec.containers[*]}{.name}{','}{end}{'\\n'}{end}",
+            ]
+            pod_res = subprocess.run(
+                find_pod_cmd, capture_output=True, text=True, timeout=5
+            )
+            if pod_res.returncode != 0:
+                return []
+
+            # Parse output to match container_name -> pod_name and namespace
+            pod_name = None
+            namespace = None
+            for line in pod_res.stdout.strip().split("\n"):
+                if not line:
+                    continue
+                parts = line.split()
+                if len(parts) >= 3:
+                    ns, p_name, containers_str = parts[0], parts[1], parts[2]
+                    containers_list = [c for c in containers_str.split(",") if c]
+                    if container_name in containers_list:
+                        pod_name = p_name
+                        namespace = ns
+                        break
+
+            if not pod_name or not namespace:
+                return []
+
+            # Step 2: Run ps inside the container
+            cmd = [
+                "kubectl",
+                "exec",
+                pod_name,
+                "-n",
+                namespace,
+                "-c",
+                container_name,
+                "--",
+                "ps",
+                "-ef",
+            ]
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
             if res.returncode != 0:
                 return []
-            
+
             processes = []
             lines = res.stdout.strip().split("\n")
             if len(lines) > 1:
@@ -136,15 +227,23 @@ class ClusterDiscoveryEngine:
                     line = line.strip()
                     if not line:
                         continue
-                    parts = line.split(None, 3)
-                    if len(parts) >= 4:
-                        processes.append({
-                            "pid": int(parts[1]) if parts[1].isdigit() else random.randint(10, 999),
-                            "user": parts[0],
-                            "cpu": round(random.uniform(0.1, 2.5), 1),
-                            "mem": round(random.uniform(0.5, 4.0), 1),
-                            "command": parts[-1]
-                        })
+                    # Split fields: UID, PID, PPID, C, STIME, TTY, TIME, CMD
+                    # Max split 7 to keep the entire command intact at the end
+                    parts = line.split(None, 7)
+                    if len(parts) >= 8:
+                        processes.append(
+                            {
+                                "pid": (
+                                    int(parts[1])
+                                    if parts[1].isdigit()
+                                    else random.randint(10, 999)
+                                ),
+                                "user": parts[0],
+                                "cpu": round(random.uniform(0.1, 2.5), 1),
+                                "mem": round(random.uniform(0.5, 4.0), 1),
+                                "command": parts[-1],  # Contains the full path/args
+                            }
+                        )
             return processes
         except Exception:
             return []
@@ -189,117 +288,17 @@ class ClusterDiscoveryEngine:
 
     def discover_active_pods(self, current_pods: List[Dict]) -> List[Dict]:
         """
-        Gathers active containers/pods dynamically probing Docker and OS processes.
+        Gathers active pods strictly from Kubernetes Client (real API or stateful YAML deployments).
+        Excludes host Docker containers and OS host processes outside Kubernetes.
         """
-        now = time.time()
-        if self._cached_pods and (now - self._last_cache_time < self._cache_duration):
-            return self._cached_pods
-
-        discovered_pods = []
-        discovered_names = set()
-        
-        # 1. Probe Docker containers if available
-        if self.is_docker_available:
-            containers = self.scrape_docker_containers()
-            stats_map = self.scrape_docker_stats()
-            
-            for c in containers:
-                c_name = c["name"]
-                if c_name in discovered_names:
-                    continue
-                discovered_names.add(c_name)
-                
-                c_stats = stats_map.get(c_name, {"cpu_pct": 2.0, "memory_mb": 15.0, "memory_limit": 512.0})
-                
-                existing = next((p for p in current_pods if p["name"] == c_name), None)
-                restarts = existing["restarts"] if existing else 0
-                
-                procs = self.scrape_container_processes(c_name)
-                if not procs:
-                    procs = [{"pid": 1, "user": "root", "cpu": c_stats["cpu_pct"], "mem": c_stats["memory_mb"], "command": c["image"]}]
-                
-                pod_status = "HEALTHY"
-                if c_stats["cpu_pct"] > 85.0 or (c_stats["memory_mb"] / c_stats["memory_limit"] * 100.0) > 85.0:
-                    pod_status = "CRITICAL"
-                elif c_stats["cpu_pct"] > 60.0 or (c_stats["memory_mb"] / c_stats["memory_limit"] * 100.0) > 60.0:
-                    pod_status = "WARNING"
-                
-                discovered_pods.append({
-                    "name": c_name,
-                    "namespace": "docker-host",
-                    "deployment": c["image"].split(":")[0].split("/")[-1],
-                    "cpu": round((c_stats["cpu_pct"] / 100.0) * 4.0, 2),
-                    "cpu_pct": c_stats["cpu_pct"],
-                    "cpu_limit": 4.0,
-                    "memory_mb": c_stats["memory_mb"],
-                    "memory_limit": c_stats["memory_limit"],
-                    "restarts": restarts,
-                    "status": pod_status,
-                    "activeProcesses": procs,
-                    "creationTime": existing["creationTime"] if existing else int(time.time() * 1000),
-                    "replicas": 1,
-                    "isAnomaly": False,
-                    "anomalyScore": 0.95,
-                    "history": [],
-                    "is_real": True,
-                    "type": "docker",
-                    "id": c["id"]
-                })
-
-        # 2. Probe host OS processes to find user processes running
-        procs = self.scrape_system_processes()
-        critical_processes = [p for p in procs if any(x in p["command"].lower() for x in ["python", "node", "streamlit", "nginx", "postgres", "redis", "java", "sh", "bash"])]
-        
-        # Select top 4 resource-heavy or interesting processes
-        critical_processes = sorted(critical_processes, key=lambda x: x["cpu"] + x["mem"], reverse=True)[:4]
-        
-        for p in critical_processes:
-            clean_comm = p['command'].split('/')[-1]
-            name = f"{clean_comm}-{p['pid']}"
-            if name in discovered_names:
-                continue
-            discovered_names.add(name)
-            
-            existing = next((p_pod for p_pod in current_pods if p_pod["name"] == name), None)
-            restarts = existing["restarts"] if existing else 0
-            
-            proc_cpu_pct = min(100.0, p["cpu"])
-            proc_mem_mb = min(4096.0, (p["mem"] / 100.0) * 4096.0)
-            if proc_mem_mb < 10.0:
-                proc_mem_mb = 45.3
-            
-            pod_status = "HEALTHY"
-            if proc_cpu_pct > 85.0 or (proc_mem_mb / 4096.0 * 100.0) > 85.0:
-                pod_status = "CRITICAL"
-            elif proc_cpu_pct > 60.0 or (proc_mem_mb / 4096.0 * 100.0) > 60.0:
-                pod_status = "WARNING"
-            
-            discovered_pods.append({
-                "name": name,
-                "namespace": "os-processes",
-                "deployment": clean_comm,
-                "cpu": round((proc_cpu_pct / 100.0) * 4.0, 2),
-                "cpu_pct": proc_cpu_pct if proc_cpu_pct > 0 else 1.2,
-                "cpu_limit": 4.0,
-                "memory_mb": round(proc_mem_mb, 1),
-                "memory_limit": 1024.0,
-                "restarts": restarts,
-                "status": pod_status,
-                "activeProcesses": [p],
-                "creationTime": existing["creationTime"] if existing else int(time.time() * 1000),
-                "replicas": 1,
-                "isAnomaly": False,
-                "anomalyScore": 0.95,
-                "history": [],
-                "is_real": True,
-                "type": "process",
-                "pid": p["pid"]
-            })
-
-        # 3. Hand over to stateful Kubernetes controller to sync and maintain persistence across runs
         import streamlit as st
+        now = time.time()
+        
+        # Pull directly from our stateful Kubernetes client
         if 'k8s_client' in st.session_state:
-            discovered_pods = st.session_state.k8s_client.sync_discovered_pods(discovered_pods)
+            discovered_pods = st.session_state.k8s_client.get_active_pods()
+        else:
+            discovered_pods = current_pods
 
         self._cached_pods = discovered_pods
         self._last_cache_time = now

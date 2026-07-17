@@ -3,7 +3,7 @@ import json
 import random
 import requests
 from typing import Dict, List, Tuple
-from config import GEMINI_API_KEY, RL_LEARNING_RATE, RL_DISCOUNT_FACTOR
+from config import GEMINI_API_KEY, GROQ_API_KEY, RL_LEARNING_RATE, RL_DISCOUNT_FACTOR
 
 ACTIONS = ['scale_up', 'scale_down', 'restart', 'delete_pod', 'kill_process', 'do_nothing']
 
@@ -71,19 +71,19 @@ class QLearningOptimizer:
         return q_vals[action]
 
 
-class GeminiSREAgent:
+class GroqSREAgent:
     """
-    Connects to Gemini-2.5-Flash using REST API.
+    Connects to Groq using REST API (OpenAI-compatible chat completions).
     Provides diagnostic insights, explains root-causes of memory/cpu anomalies,
     and returns precise remedial blueprints.
     """
     def __init__(self):
-        self.api_key = GEMINI_API_KEY
-        self.model = "gemini-2.5-flash"
+        self.api_key = GROQ_API_KEY
+        self.model = "llama-3.3-70b-versatile"
 
     def get_recommendations(self, pod: Dict) -> List[Dict]:
         """
-        Fetches structured recommendations from Gemini 2.5 Flash.
+        Fetches structured recommendations from Groq.
         If API Key is missing or request fails, falls back gracefully to a robust rule-based advisor.
         """
         process_str = "\n".join(
@@ -120,33 +120,24 @@ class GeminiSREAgent:
             return self.get_fallback_recommendations(pod)
 
         try:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent?key={self.api_key}"
-            headers = {'Content-Type': 'application/json'}
+            url = "https://api.groq.com/openai/v1/chat/completions"
+            headers = {
+                'Content-Type': 'application/json',
+                'Authorization': f'Bearer {self.api_key}'
+            }
             payload = {
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {
-                    "responseMimeType": "application/json",
-                    "responseSchema": {
-                        "type": "ARRAY",
-                        "items": {
-                            "type": "OBJECT",
-                            "properties": {
-                                "rank": {"type": "INTEGER"},
-                                "action": {"type": "STRING"},
-                                "reason": {"type": "STRING"},
-                                "kubectl_command": {"type": "STRING"},
-                                "impact": {"type": "STRING"}
-                            },
-                            "required": ["rank", "action", "reason", "kubectl_command", "impact"]
-                        }
-                    }
-                }
+                "model": self.model,
+                "messages": [
+                    {"role": "user", "content": prompt}
+                ],
+                "temperature": 0.1,
+                "response_format": { "type": "json_object" }
             }
             
             response = requests.post(url, headers=headers, json=payload, timeout=8)
             if response.status_code == 200:
                 data = response.json()
-                text = data['candidates'][0]['content']['parts'][0]['text']
+                text = data['choices'][0]['message']['content']
                 return json.loads(text)
         except Exception:
             pass
@@ -258,3 +249,5 @@ class GeminiSREAgent:
                         "impact": "low"
                     }
                 ]
+
+GeminiSREAgent = GroqSREAgent

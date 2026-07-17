@@ -23,6 +23,24 @@ services:
       CLUSTER_ID: 'MkU3OEVBNTcwNTJENDM2Qk'
     volumes:
       - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "127.0.0.1:9092", "--list"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  prometheus-kafka-adapter:
+    image: telefonica/prometheus-kafka-adapter:1.8.0
+    container_name: prometheus-kafka-adapter
+    ports:
+      - "8080:8080"
+    environment:
+      - KAFKA_BROKER_LIST=kafka:29092
+      - KAFKA_TOPIC=sre-pod-telemetry
+      - PORT=8080
+    depends_on:
+      kafka:
+        condition: service_healthy
 
 volumes:
   kafka_data:

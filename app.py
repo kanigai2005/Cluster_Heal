@@ -17,7 +17,7 @@ import config
 from anomaly_detection import SREAnomalyDetector
 from dynamic_discovery import ClusterDiscoveryEngine
 from k8s_client import KubernetesClientSimulator
-from rl_optimizer import QLearningOptimizer, GeminiSREAgent, ACTIONS
+from rl_optimizer import QLearningOptimizer, GroqSREAgent, ACTIONS
 from kafka_producer import TelemetryProducerSimulator
 from kafka_consumer import TelemetryConsumerSimulator
 
@@ -40,8 +40,8 @@ if 'k8s_client' not in st.session_state:
     st.session_state.k8s_client = KubernetesClientSimulator()
 if 'rl_optimizer' not in st.session_state:
     st.session_state.rl_optimizer = QLearningOptimizer()
-if 'gemini_agent' not in st.session_state:
-    st.session_state.gemini_agent = GeminiSREAgent()
+if 'groq_agent' not in st.session_state:
+    st.session_state.groq_agent = GroqSREAgent()
 if 'kafka_producer' not in st.session_state:
     st.session_state.kafka_producer = TelemetryProducerSimulator(config.KAFKA_BOOTSTRAP_SERVERS)
 if 'kafka_consumer' not in st.session_state:
@@ -87,6 +87,8 @@ if 'last_update_time' not in st.session_state:
     st.session_state.last_update_time = time.time()
 if 'kafka_msg_log' not in st.session_state:
     st.session_state.kafka_msg_log = []
+if 'logged_in' not in st.session_state:
+    st.session_state.logged_in = False
 
 # ==========================================
 # CUSTOM THEMING & CSS STYLE INJECTIONS
@@ -268,6 +270,45 @@ def run_fluctuation_step():
             continue
 
         # 2. Simulated fluctuation for simulation containers
+        
+        # If this pod is updated by real Kafka metrics, skip simulated fluctuations completely to keep real data accurate!
+        is_kafka_updated = pod.get("is_kafka_updated", False)
+        if 'k8s_client' in st.session_state:
+            real_metrics = st.session_state.k8s_client.real_pod_metrics.get(pod["name"], {})
+            if real_metrics.get("is_kafka_updated", False):
+                is_kafka_updated = True
+                pod["cpu_pct"] = real_metrics.get("cpu_pct", pod["cpu_pct"])
+                pod["memory_mb"] = real_metrics.get("memory_mb", pod["memory_mb"])
+                if "status" in real_metrics:
+                    pod["status"] = real_metrics["status"]
+                    
+        if is_kafka_updated:
+            pod["cpu"] = round((pod["cpu_pct"] / 100.0) * pod["cpu_limit"], 2)
+            mem_pct = (pod["memory_mb"] / max(1.0, pod["memory_limit"])) * 100.0
+            
+            # Recalculate status based on real metrics and SRE thresholds
+            if pod["cpu_pct"] >= config.CPU_CRITICAL_THRESHOLD_PCT or mem_pct >= config.MEM_CRITICAL_THRESHOLD_PCT:
+                pod["status"] = "CRITICAL"
+            elif pod["cpu_pct"] >= config.CPU_WARNING_THRESHOLD_PCT or mem_pct >= config.MEM_WARNING_THRESHOLD_PCT:
+                pod["status"] = "WARNING"
+            else:
+                pod["status"] = "HEALTHY"
+                
+            is_anomaly, score = st.session_state.anomaly_detector.analyze_metrics(pod["cpu_pct"], mem_pct)
+            pod["isAnomaly"] = is_anomaly
+            pod["anomalyScore"] = score
+            
+            if "history" not in pod:
+                pod["history"] = []
+            pod["history"].append({
+                "cpu_pct": round(pod["cpu_pct"], 1),
+                "memory_mb": round(pod["memory_mb"], 1),
+                "timestamp": int(time.time() * 1000)
+            })
+            if len(pod["history"]) > 25:
+                pod["history"].pop(0)
+            continue
+
         # Check active processes to decide baseline metrics
         has_stress = any("stress" in p["command"] for p in pod.get("activeProcesses", []))
         has_leak = any("java" in p["command"] for p in pod.get("activeProcesses", []))
@@ -333,9 +374,154 @@ def run_fluctuation_step():
         if len(pod["history"]) > 25:
             pod["history"].pop(0)
 
-    # Simulate Kafka telemetry stream push
+    # 1. Produce telemetry metrics to Kafka
     pushed_logs = st.session_state.kafka_producer.send_telemetry_batch(st.session_state.pods, config.KAFKA_TOPIC_TELEMETRY)
     st.session_state.kafka_msg_log.extend(pushed_logs)
+    
+    # PRINT sent messages to terminal as requested
+    for log in pushed_logs:
+        print(f"\033[36m[KAFKA-PRODUCER-STDOUT]\033[0m {log}", flush=True)
+
+    # 2. Poll live telemetry from Kafka Consumer
+    # Allows SRE dashboard to absorb metrics from both local simulators and Prometheus-Kafka-Adapter streams
+    polled_msgs = st.session_state.kafka_consumer.poll_messages(config.KAFKA_TOPIC_TELEMETRY, limit=10)
+    for msg in polled_msgs:
+        t_str = msg.get("timestamp_str", time.strftime("%H:%M:%S"))
+        src = msg.get("source", "SIMULATION")
+        pod_name = msg.get("pod_name")
+        
+        # PRINT received messages to terminal as requested
+        import json
+        print(f"\033[32m[KAFKA-CONSUMER-STDOUT]\033[0m RECV message on topic '{config.KAFKA_TOPIC_TELEMETRY}': {json.dumps(msg)}", flush=True)
+        
+        if msg.get("type") == "prometheus_adapter_metric":
+            metric_name = msg.get("metric_name")
+            metric_value = msg.get("metric_value")
+            labels = msg.get("labels", {})
+            log_str = f"[{t_str}] [{src}] RECV prometheus_metric='{metric_name}' value={metric_value} namespace='{msg.get('namespace')}'"
+            
+            # Map Prometheus metric value back to matching discovered pod if possible
+            matched_pod = None
+            if pod_name and pod_name not in ["unknown-pod", "generic-stream"]:
+                matched_pod = next((p for p in st.session_state.pods if p["name"] == pod_name), None)
+                if not matched_pod:
+                    matched_pod = next((p for p in st.session_state.pods if pod_name.startswith(p["name"]) or p["name"].startswith(pod_name)), None)
+                if not matched_pod:
+                    matched_pod = next((p for p in st.session_state.pods if pod_name.startswith(p["deployment"]) or p["deployment"].startswith(pod_name)), None)
+            
+            # Compute parsed value
+            cpu_val = None
+            mem_val = None
+            if "cpu" in metric_name.lower():
+                cpu_val = min(100.0, max(0.0, metric_value if metric_value > 1.0 else metric_value * 100.0))
+            elif "memory" in metric_name.lower() or "rss" in metric_name.lower():
+                # If bytes, convert to MB safely
+                mem_val = round(metric_value / (1024.0 * 1024.0), 1) if metric_value > 1000000 else metric_value
+            
+            # Update stateful metric cache in k8s_client
+            if 'k8s_client' in st.session_state:
+                st.session_state.k8s_client.update_pod_metrics(pod_name, cpu_pct=cpu_val, memory_mb=mem_val)
+                if matched_pod and matched_pod["name"] != pod_name:
+                    st.session_state.k8s_client.update_pod_metrics(matched_pod["name"], cpu_pct=cpu_val, memory_mb=mem_val)
+
+            if matched_pod:
+                # Update pod's live metrics from Prometheus!
+                if cpu_val is not None:
+                    matched_pod["cpu_pct"] = cpu_val
+                if mem_val is not None:
+                    matched_pod["memory_mb"] = mem_val
+                matched_pod["is_kafka_updated"] = True
+            elif pod_name and pod_name not in ["unknown-pod", "generic-stream"]:
+                # Register a new K8s pod from Prometheus Kafka Adapter dynamically!
+                final_cpu = cpu_val if cpu_val is not None else 5.0
+                final_mem = mem_val if mem_val is not None else 45.0
+                
+                # Clean deployment name
+                dep_parts = pod_name.split("-")
+                deployment_name = "-".join(dep_parts[:-2]) if (len(dep_parts) >= 3 and len(dep_parts[-1]) == 5 and dep_parts[-1].isalnum()) else pod_name
+                
+                new_pod = {
+                    "name": pod_name,
+                    "namespace": msg.get("namespace", "default"),
+                    "deployment": deployment_name,
+                    "cpu": round((final_cpu / 100.0) * 4.0, 2),
+                    "cpu_pct": final_cpu,
+                    "cpu_limit": 4.0,
+                    "memory_mb": final_mem,
+                    "memory_limit": 1024.0,
+                    "restarts": 0,
+                    "status": "HEALTHY",
+                    "activeProcesses": [{"pid": random.randint(1000, 9999), "user": "prometheus", "cpu": final_cpu, "mem": 1.2, "command": "k8s-container"}],
+                    "creationTime": int(time.time() * 1000),
+                    "replicas": 1,
+                    "isAnomaly": False,
+                    "anomalyScore": 0.95,
+                    "history": [{"cpu_pct": final_cpu, "memory_mb": final_mem, "timestamp": int(time.time() * 1000)}],
+                    "is_real": True,
+                    "type": "k8s_pod",
+                    "is_kafka_updated": True
+                }
+                st.session_state.pods.append(new_pod)
+                if 'k8s_client' in st.session_state:
+                    st.session_state.k8s_client.pods.append(new_pod)
+                log_str = f"[{t_str}] [PROMETHEUS_KAFKA] 🌟 DISCOVERED NEW POD via Kafka: name={pod_name} namespace={msg.get('namespace')}"
+                    
+        elif msg.get("type") == "sre_platform_telemetry":
+            log_str = f"[{t_str}] [{src}] RECV key={pod_name} cpu={msg.get('cpu_pct')}% mem={msg.get('memory_mb')}MB status={msg.get('status')}"
+            
+            cpu_val = msg.get("cpu_pct")
+            mem_val = msg.get("memory_mb")
+            status_val = msg.get("status")
+            
+            # Update stateful metric cache in k8s_client
+            if 'k8s_client' in st.session_state:
+                st.session_state.k8s_client.update_pod_metrics(pod_name, cpu_pct=cpu_val, memory_mb=mem_val, status=status_val)
+            
+            # Update matching pods from live SRE stream
+            matched_pod = next((p for p in st.session_state.pods if p["name"] == pod_name), None)
+            if matched_pod:
+                if cpu_val is not None:
+                    matched_pod["cpu_pct"] = cpu_val
+                if mem_val is not None:
+                    matched_pod["memory_mb"] = mem_val
+                if status_val is not None:
+                    matched_pod["status"] = status_val
+                matched_pod["is_kafka_updated"] = True
+            elif pod_name and pod_name not in ["unknown-pod", "generic-stream"]:
+                # Register new pod from raw telemetry
+                dep_parts = pod_name.split("-")
+                deployment_name = "-".join(dep_parts[:-2]) if (len(dep_parts) >= 3 and len(dep_parts[-1]) == 5 and dep_parts[-1].isalnum()) else pod_name
+                
+                new_pod = {
+                    "name": pod_name,
+                    "namespace": msg.get("namespace", "default"),
+                    "deployment": deployment_name,
+                    "cpu": round((msg.get("cpu_pct", 5.0) / 100.0) * 4.0, 2),
+                    "cpu_pct": msg.get("cpu_pct", 5.0),
+                    "cpu_limit": 4.0,
+                    "memory_mb": msg.get("memory_mb", 45.0),
+                    "memory_limit": 1024.0,
+                    "restarts": 0,
+                    "status": msg.get("status", "HEALTHY"),
+                    "activeProcesses": [{"pid": random.randint(1000, 9999), "user": "sre-agent", "cpu": msg.get("cpu_pct", 5.0), "mem": 1.2, "command": "k8s-container"}],
+                    "creationTime": int(time.time() * 1000),
+                    "replicas": 1,
+                    "isAnomaly": False,
+                    "anomalyScore": 0.95,
+                    "history": [{"cpu_pct": msg.get("cpu_pct", 5.0), "memory_mb": msg.get("memory_mb", 45.0), "timestamp": int(time.time() * 1000)}],
+                    "is_real": True,
+                    "type": "k8s_pod",
+                    "is_kafka_updated": True
+                }
+                st.session_state.pods.append(new_pod)
+                if 'k8s_client' in st.session_state:
+                    st.session_state.k8s_client.pods.append(new_pod)
+                log_str = f"[{t_str}] [KAFKA_STREAM] 🌟 DISCOVERED NEW POD via Kafka: name={pod_name} namespace={msg.get('namespace')}"
+        else:
+            log_str = f"[{t_str}] [{src}] RECV message on topic={msg.get('topic')} (Raw format)"
+            
+        st.session_state.kafka_msg_log.append(log_str)
+
     if len(st.session_state.kafka_msg_log) > 50:
         st.session_state.kafka_msg_log = st.session_state.kafka_msg_log[-50:]
 
@@ -572,6 +758,43 @@ def purge_simulator_state():
     st.toast("Simulator database reset successfully!", icon="🔄")
 
 # ==========================================
+# AUTHENTICATION ACCESS CONTROL (LOGIN PAGE)
+# ==========================================
+if not st.session_state.get('logged_in', False):
+    st.markdown("""
+        <div style="max-width: 600px; margin: 40px auto; padding: 30px; background-color: #161b22; border: 1px solid #30363d; border-radius: 12px; box-shadow: 0 8px 32px rgba(0,0,0,0.5); text-align: center;">
+            <span style="font-size: 60px; filter: drop-shadow(0 0 15px rgba(88,166,255,0.4));">🤖</span>
+            <h1 style="color: #ffffff; font-size: 28px; margin-top: 15px; margin-bottom: 5px; font-family: 'Inter', sans-serif;">SRE KUBERNETES PORTAL</h1>
+            <p style="color: #8b949e; font-size: 14px; font-family: 'JetBrains Mono', monospace; letter-spacing: 0.5px;">AUTONOMOUS AGENT REINFORCEMENT LEARNING DECK</p>
+            <div style="height: 1px; background-color: #30363d; margin: 25px 0;"></div>
+            <p style="color: #c9d1d9; font-size: 15px; margin-bottom: 25px; line-height: 1.5; font-family: 'Inter', sans-serif;">
+                Access is restricted to authorized Site Reliability Engineers. Please authenticate using your secure access keys to decrypt telemetry pipelines and activate the Q-learning policy tables.
+            </p>
+        </div>
+    """, unsafe_allow_html=True)
+    
+    col_l, col_c, col_r = st.columns([1.1, 2.0, 1.1])
+    with col_c:
+        with st.form("login_form"):
+            st.markdown("<h4 style='text-align: center; color: #58a6ff; font-family: monospace; margin-bottom: 15px;'>🛡️ CREDENTIALS CHECKPOINT</h4>", unsafe_allow_html=True)
+            username = st.text_input("Username / SRE Operator ID", value="admin", help="Default credentials: admin")
+            password = st.text_input("Access Control Password", type="password", value="sre-password", help="Default credentials: sre-password")
+            submitted = st.form_submit_button("🔑 DECRYPT & INITIALIZE CONSOLE", use_container_width=True)
+            
+            if submitted:
+                if username == "admin" and password == "sre-password":
+                    st.session_state.logged_in = True
+                    st.success("Authorization successful! Fetching real-time container metrics...")
+                    st.toast("Welcome back, SRE Engineer!", icon="🔑")
+                    time.sleep(1.0)
+                    st.rerun()
+                else:
+                    st.error("Access Denied: Invalid operator identity or security passkey.")
+                    
+    # Prevent rendering the main portal under unauthorized sessions
+    st.stop()
+
+# ==========================================
 # SIDEBAR / CONFIGURATION WINDOW
 # ==========================================
 with st.sidebar:
@@ -630,7 +853,7 @@ st.markdown(clean_html(f"""
                     <h1 style="margin: 0; font-size: 20px; color: #ffffff;">AUTONOMOUS AI-POD SRE PORTAL</h1>
                     <span style="font-size: 10px; background-color: #21262d; color: #58a6ff; border: 1px solid #30363d; padding: 2px 6px; border-radius: 4px; font-family: monospace;">PY-STRE-1.3</span>
                 </div>
-                <p style="margin: 4px 0 0 0; font-size: 12px; color: #8b949e;">Kubernetes Namespace Control Deck • Reinforcement Learning Optimization Engine • Gemini 2.5 Diagnostic Copilot</p>
+                <p style="margin: 4px 0 0 0; font-size: 12px; color: #8b949e;">Kubernetes Namespace Control Deck • Reinforcement Learning Optimization Engine • Groq Llama-3.3 Diagnostic Copilot</p>
             </div>
         </div>
     </div>
@@ -861,6 +1084,31 @@ with tab_telemetry:
     st.markdown("---")
     st.markdown("### 📻 Real-time Telemetry Event Log (Kafka Message Stream)")
     
+    # Visual Kafka Health Monitor Checkpoint
+    kafka_connected = st.session_state.kafka_producer.connected and st.session_state.kafka_consumer.connected
+    broker_address = config.KAFKA_BOOTSTRAP_SERVERS
+    
+    status_text = "💚 KAFKA BROKER ONLINE & ACTIVE" if kafka_connected else "💻 EMBEDDED TELEMETRY PIPELINE NOMINAL"
+    status_color = "#39ff14" if kafka_connected else "#00e5ff"
+    
+    st.markdown(f"""
+        <div style="background-color: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; margin-bottom: 16px;">
+            <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
+                <div>
+                    <span style="font-size: 13px; color: #8b949e; font-family: monospace; font-weight: bold;">KAFKA CLUSTER STATUS</span>
+                    <div style="font-size: 18px; font-weight: bold; font-family: monospace; color: {status_color};">{status_text}</div>
+                </div>
+                <div style="text-align: right; min-width: 150px;">
+                    <span style="font-size: 13px; color: #8b949e; font-family: monospace; font-weight: bold;">BOOTSTRAP SERVER</span>
+                    <div style="font-size: 14px; font-family: monospace; color: #c9d1d9;">{broker_address}</div>
+                </div>
+            </div>
+            <div style="margin-top: 10px; font-size: 14px; color: #8b949e; font-family: 'Inter', sans-serif; line-height: 1.4;">
+                {"Real-time confluent cp-kafka driver is fully initialized and streaming live container metrics to the SRE console." if kafka_connected else f"The applet is executing the robust telemetry pipeline. Since a raw Kafka container is not running on this sandbox's host (Docker service not available), the pipeline automatically initialized the built-in high-fidelity Telemetry Bus to stream metrics safely without crashing."}
+            </div>
+        </div>
+    """, unsafe_allow_html=True)
+    
     # Display recent logs in terminal block
     if st.session_state.kafka_msg_log:
         recent_kafka_logs = "\n".join(st.session_state.kafka_msg_log[-12:])
@@ -939,7 +1187,7 @@ with tab_remediation:
                     st.rerun()
 
     with rem_col2:
-        st.markdown("### 🧠 SRE Diagnostic Advisor (Gemini 2.5 Flash)")
+        st.markdown("### 🧠 SRE Diagnostic Advisor (Groq Llama-3.3)")
         st.markdown("AI-Copilot reviews active cAdvisor telemetry arrays and container process profiles to produce exact remedial commands.")
         
         ai_target_pod_name = st.selectbox(
@@ -950,10 +1198,10 @@ with tab_remediation:
         ai_target_pod = next((p for p in st.session_state.pods if p["name"] == ai_target_pod_name), None)
         
         if ai_target_pod:
-            if st.button("🔮 Ask Gemini Copilot", help="Query Gemini SRE diagnostic API"):
+            if st.button("🔮 Ask Groq Copilot", help="Query Groq SRE diagnostic API"):
                 with st.spinner("Analyzing container telemetry logs, CPU metrics, memory blocks, and active process matrices..."):
                     # Pull recommendations
-                    recs = st.session_state.gemini_agent.get_recommendations(ai_target_pod)
+                    recs = st.session_state.groq_agent.get_recommendations(ai_target_pod)
                     st.session_state.ai_recs_cache[ai_target_pod["name"]] = recs
                     st.session_state.ai_queries_count += 1
                     
@@ -991,7 +1239,7 @@ with tab_remediation:
                         execute_remediation(ai_target_pod["name"], raw_act, "AI_COPILOT")
                         st.rerun()
             else:
-                st.info("No active diagnostic recipe generated for this pod. Query the Gemini Advisor above to generate recipes.")
+                st.info("No active diagnostic recipe generated for this pod. Query the Groq Advisor above to generate recipes.")
 
 # ==========================================
 # WINDOW 3: RL POLICY INSIGHTS & CONFIGURATION
@@ -1080,7 +1328,7 @@ with tab_rl:
         
         st.markdown("#### Live Telemetry Metrics")
         st.metric(label="Exploration Rate (Epsilon Decayed)", value=f"{st.session_state.epsilon:.3f}")
-        st.metric(label="Gemini LLM Queries Executed", value=st.session_state.ai_queries_count)
+        st.metric(label="Groq LLM Queries Executed", value=st.session_state.ai_queries_count)
         st.metric(label="Continuous Scrape Step", value=st.session_state.total_steps)
 
 # Footer credit
@@ -1090,3 +1338,9 @@ st.markdown(clean_html("""
         AI-Pod Site Reliability Control Matrix • Engineered fully in Python • Conforms to standard SRE SLA guidelines.
     </div>
 """), unsafe_allow_html=True)
+
+# Live continuous refresh block to auto-run the telemetry scraping loop every 3 seconds
+if loop_enabled:
+    time.sleep(3)
+    st.rerun()
+

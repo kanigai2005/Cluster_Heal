@@ -14,19 +14,23 @@ spec:
     metadata:
       labels:
         app: esp-traffic-camera
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
     spec:
       containers:
-        - name: traffic-camera
-          image: custom/esp-traffic-camera:v1.3.4
-          resources:
-            limits:
-              cpu: "4"
-              memory: "512Mi"
-            requests:
-              cpu: "1"
-              memory: "256Mi"
-          ports:
-            - containerPort: 8080
+      - name: traffic-camera
+        image: custom/esp-traffic-camera:v1.3.4
+        resources:
+          limits:
+            cpu: "4"
+            memory: "512Mi"
+          requests:
+            cpu: "1"
+            memory: "256Mi"
+        ports:
+        - containerPort: 8080
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -44,17 +48,23 @@ spec:
     metadata:
       labels:
         app: esp-water-sensor
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
     spec:
       containers:
-        - name: water-polling
-          image: custom/esp-water-sensor:v1.0.1
-          resources:
-            limits:
-              cpu: "2"
-              memory: "256Mi"
-            requests:
-              cpu: "500m"
-              memory: "128Mi"
+      - name: water-polling
+        image: custom/esp-water-sensor:v1.0.1
+        resources:
+          limits:
+            cpu: "2"
+            memory: "256Mi"
+          requests:
+            cpu: "500m"
+            memory: "128Mi"
+        ports:
+        - containerPort: 8080
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -72,14 +82,20 @@ spec:
     metadata:
       labels:
         app: esp-smart-kitchen
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
     spec:
       containers:
-        - name: kitchen-hub
-          image: custom/esp-kitchen-hub:v2.1.0
-          resources:
-            limits:
-              cpu: "2"
-              memory: "512Mi"
-            requests:
-              cpu: "500m"
-              memory: "256Mi"
+      - name: kitchen-hub
+        image: custom/esp-kitchen-hub:v2.1.0
+        resources:
+          limits:
+            cpu: "2"
+            memory: "512Mi"
+          requests:
+            cpu: "500m"
+            memory: "256Mi"
+        ports:
+        - containerPort: 8080
