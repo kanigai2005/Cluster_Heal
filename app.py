@@ -219,181 +219,47 @@ def run_fluctuation_step():
     """
     # Ensure active pods are discovered (real and/or simulated)
     st.session_state.pods = st.session_state.discovery_engine.discover_active_pods(st.session_state.pods)
+    deleted_set = st.session_state.get('deleted_pods', set())
+    if deleted_set:
+        st.session_state.pods = [p for p in st.session_state.pods if p["name"] not in deleted_set]
     
     # Efficiently gather stats for real containers and processes in one go
-    docker_stats = st.session_state.discovery_engine.scrape_docker_stats() if st.session_state.discovery_engine.is_docker_available else {}
-    system_procs = {p["pid"]: p for p in st.session_state.discovery_engine.scrape_system_processes()} if not docker_stats else {}
+    k8s_stats = st.session_state.discovery_engine.scrape_docker_stats() if st.session_state.discovery_engine.is_k8s_available else {}
+    system_procs = {p["pid"]: p for p in st.session_state.discovery_engine.scrape_system_processes()} if not k8s_stats else {}
     
     for pod in st.session_state.pods:
-        if pod.get("is_real", False):
-            # 1. Update from actual scraped live metrics
-            if pod.get("type") == "docker":
-                c_stats = docker_stats.get(pod["name"], None)
-                if c_stats:
-                    pod["cpu_pct"] = c_stats["cpu_pct"]
-                    pod["memory_mb"] = c_stats["memory_mb"]
-                    pod["memory_limit"] = max(1.0, c_stats["memory_limit"])
-            elif pod.get("type") == "process":
-                proc_info = system_procs.get(pod.get("pid"), None)
-                if proc_info:
-                    pod["cpu_pct"] = min(100.0, proc_info["cpu"])
-                    # Translate process memory % of standard host system to MB (assuming 4GB)
-                    pod["memory_mb"] = round((proc_info["mem"] / 100.0) * 4096.0, 1)
+        pod_name = pod["name"]
+        
+        # 1. Update from actual scraped live kubectl top metrics if available
+        if pod_name in k8s_stats:
+            stat = k8s_stats[pod_name]
+            limit = max(0.1, pod.get("cpu_limit", 4.0))
+            cpu_cores = stat.get("cpu_cores", (stat["cpu_pct"] / 100.0) * limit)
+            cpu_pct = min(100.0, round((cpu_cores / limit) * 100.0, 1))
             
-            # Recalculate Cores cpu usage from CPU %
-            pod["cpu"] = round((pod["cpu_pct"] / 100.0) * pod["cpu_limit"], 2)
+            pod["cpu_pct"] = cpu_pct
+            pod["cpu"] = round(cpu_cores, 2)
+            pod["memory_mb"] = stat["memory_mb"]
+            pod["is_real"] = True
             
-            # Status check
-            mem_pct = (pod["memory_mb"] / max(1.0, pod["memory_limit"])) * 100.0
-            if pod["cpu_pct"] >= config.CPU_CRITICAL_THRESHOLD_PCT or mem_pct >= config.MEM_CRITICAL_THRESHOLD_PCT:
+            if 'k8s_client' in st.session_state:
+                st.session_state.k8s_client.update_pod_metrics(pod_name, cpu_pct=cpu_pct, memory_mb=stat["memory_mb"])
+        elif pod.get("is_real", False) and pod.get("type") == "process":
+            proc_info = system_procs.get(pod.get("pid"), None)
+            if proc_info:
+                pod["cpu_pct"] = min(100.0, proc_info["cpu"])
+                pod["memory_mb"] = round((proc_info["mem"] / 100.0) * 4096.0, 1)
+                pod["cpu"] = round((pod["cpu_pct"] / 100.0) * pod.get("cpu_limit", 4.0), 2)
+        
+        # Status check & anomaly score calculation
+        mem_pct = (pod["memory_mb"] / max(1.0, pod["memory_limit"])) * 100.0
+        if pod.get("status") in ["HEALTHY", "Running", "OK", "CRITICAL", "WARNING"]:
+            if pod["cpu_pct"] >= config.CPU_CRITICAL_THRESHOLD_PCT or mem_pct >= config.MEM_CRITICAL_THRESHOLD_PCT or pod.get("is_stressed"):
                 pod["status"] = "CRITICAL"
             elif pod["cpu_pct"] >= config.CPU_WARNING_THRESHOLD_PCT or mem_pct >= config.MEM_WARNING_THRESHOLD_PCT:
                 pod["status"] = "WARNING"
             else:
                 pod["status"] = "HEALTHY"
-                
-            # Isolation Forest Anomaly Analysis
-            is_anomaly, score = st.session_state.anomaly_detector.analyze_metrics(pod["cpu_pct"], mem_pct)
-            pod["isAnomaly"] = is_anomaly
-            pod["anomalyScore"] = score
-            
-            # Time-series history
-            if "history" not in pod:
-                pod["history"] = []
-            pod["history"].append({
-                "cpu_pct": round(pod["cpu_pct"], 1),
-                "memory_mb": round(pod["memory_mb"], 1),
-                "timestamp": int(time.time() * 1000)
-            })
-            if len(pod["history"]) > 25:
-                pod["history"].pop(0)
-            continue
-
-        # 2. Simulated fluctuation for simulation containers
-        
-        # If this pod is updated by real Kafka metrics, skip simulated fluctuations completely to keep real data accurate!
-        is_kafka_updated = pod.get("is_kafka_updated", False)
-        if 'k8s_client' in st.session_state:
-            real_metrics = st.session_state.k8s_client.real_pod_metrics.get(pod["name"], {})
-            if real_metrics.get("is_kafka_updated", False):
-                is_kafka_updated = True
-                pod["cpu_pct"] = real_metrics.get("cpu_pct", pod["cpu_pct"])
-                pod["memory_mb"] = real_metrics.get("memory_mb", pod["memory_mb"])
-                if "status" in real_metrics:
-                    pod["status"] = real_metrics["status"]
-                    
-        if is_kafka_updated:
-            pod["cpu"] = round((pod["cpu_pct"] / 100.0) * pod["cpu_limit"], 2)
-            mem_pct = (pod["memory_mb"] / max(1.0, pod["memory_limit"])) * 100.0
-            
-            # Recalculate status based on real metrics and SRE thresholds
-            if pod["status"] not in ["STOPPED", "Error in image pulling", "ErrImagePull", "ImagePullBackOff"]:
-                if pod["cpu_pct"] >= config.CPU_CRITICAL_THRESHOLD_PCT or mem_pct >= config.MEM_CRITICAL_THRESHOLD_PCT:
-                    pod["status"] = "CRITICAL"
-                elif pod["cpu_pct"] >= config.CPU_WARNING_THRESHOLD_PCT or mem_pct >= config.MEM_WARNING_THRESHOLD_PCT:
-                    pod["status"] = "WARNING"
-                else:
-                    pod["status"] = "HEALTHY"
-                
-            is_anomaly, score = st.session_state.anomaly_detector.analyze_metrics(pod["cpu_pct"], mem_pct)
-            pod["isAnomaly"] = is_anomaly
-            pod["anomalyScore"] = score
-            
-            if "history" not in pod:
-                pod["history"] = []
-            pod["history"].append({
-                "cpu_pct": round(pod["cpu_pct"], 1),
-                "memory_mb": round(pod["memory_mb"], 1),
-                "timestamp": int(time.time() * 1000)
-            })
-            if len(pod["history"]) > 25:
-                pod["history"].pop(0)
-            continue
-        elif pod.get("status") == "STOPPED":
-            pod["cpu_pct"] = 0.0
-            pod["cpu"] = 0.0
-            pod["memory_mb"] = 0.0
-            pod["activeProcesses"] = []
-            pod["isAnomaly"] = False
-            pod["anomalyScore"] = 1.0
-            
-            if "history" not in pod:
-                pod["history"] = []
-            pod["history"].append({
-                "cpu_pct": 0.0,
-                "memory_mb": 0.0,
-                "timestamp": int(time.time() * 1000)
-            })
-            if len(pod["history"]) > 25:
-                pod["history"].pop(0)
-            continue
-        elif pod.get("status") in ["Error in image pulling", "ErrImagePull", "ImagePullBackOff"]:
-            pod["cpu_pct"] = 0.0
-            pod["cpu"] = 0.0
-            pod["memory_mb"] = 0.0
-            pod["activeProcesses"] = [{"pid": 0, "user": "kubelet", "cpu": 0.0, "mem": 0.0, "command": "ErrImagePull: rpc error: image pull failed"}]
-            pod["isAnomaly"] = True
-            pod["anomalyScore"] = -0.8
-            
-            if "history" not in pod:
-                pod["history"] = []
-            pod["history"].append({
-                "cpu_pct": 0.0,
-                "memory_mb": 0.0,
-                "timestamp": int(time.time() * 1000)
-            })
-            if len(pod["history"]) > 25:
-                pod["history"].pop(0)
-            continue
-
-        # Check active processes to decide baseline metrics
-        has_stress = any("stress" in p["command"] for p in pod.get("activeProcesses", []))
-        has_leak = any("java" in p["command"] for p in pod.get("activeProcesses", []))
-        
-        target_cpu_pct = 15.0
-        target_mem_pct = 20.0
-        
-        if has_stress:
-            target_cpu_pct = 94.0
-        if has_leak:
-            # Memory leak grows based on how long pod has been alive (creationTime)
-            elapsed_sec = (time.time() - (pod["creationTime"] / 1000.0))
-            # Grows 0.5% per minute
-            leak_addition = min(75.0, (elapsed_sec / 60.0) * 8.0)
-            target_mem_pct = 40.0 + leak_addition
-            target_cpu_pct = max(target_cpu_pct, 45.0)
-            
-        # Replicas divide the CPU stress
-        if pod["replicas"] > 1:
-            target_cpu_pct = target_cpu_pct / pod["replicas"]
-            target_mem_pct = target_mem_pct / (pod["replicas"] * 0.9)
-            
-        # Fluctuate with smooth average
-        pod["cpu_pct"] = max(1.0, min(100.0, pod["cpu_pct"] * 0.8 + target_cpu_pct * 0.2 + random.uniform(-1.5, 1.5)))
-        pod["cpu"] = round((pod["cpu_pct"] / 100.0) * pod["cpu_limit"], 2)
-        
-        # Calculate memory MB
-        max_mem = pod["memory_limit"]
-        target_mb = (target_mem_pct / 100.0) * max_mem
-        pod["memory_mb"] = max(10.0, min(max_mem, pod["memory_mb"] * 0.9 + target_mb * 0.1 + random.uniform(-3.0, 3.0)))
-        pod["memory_mb"] = round(pod["memory_mb"], 1)
-        
-        # Sync active process logs
-        for p in pod.get("activeProcesses", []):
-            if "stress" in p["command"]:
-                p["cpu"] = round(pod["cpu_pct"] * 0.85 + random.uniform(-0.5, 0.5), 1)
-            elif "java" in p["command"]:
-                p["mem"] = round((pod["memory_mb"] / max_mem) * 100.0 * 0.75 + random.uniform(-0.5, 0.5), 1)
-                p["cpu"] = round(25.0 + random.uniform(-2.0, 2.0), 1)
-
-        # Status check
-        mem_pct = (pod["memory_mb"] / max(1.0, pod["memory_limit"])) * 100.0
-        if pod["cpu_pct"] >= config.CPU_CRITICAL_THRESHOLD_PCT or mem_pct >= config.MEM_CRITICAL_THRESHOLD_PCT:
-            pod["status"] = "CRITICAL"
-        elif pod["cpu_pct"] >= config.CPU_WARNING_THRESHOLD_PCT or mem_pct >= config.MEM_WARNING_THRESHOLD_PCT:
-            pod["status"] = "WARNING"
-        else:
-            pod["status"] = "HEALTHY"
             
         # Isolation Forest Anomaly Analysis
         is_anomaly, score = st.session_state.anomaly_detector.analyze_metrics(pod["cpu_pct"], mem_pct)
@@ -420,14 +286,12 @@ def run_fluctuation_step():
         print(f"\033[36m[KAFKA-PRODUCER-STDOUT]\033[0m {log}", flush=True)
 
     # 2. Poll live telemetry from Kafka Consumer
-    # Allows SRE dashboard to absorb metrics from both local simulators and Prometheus-Kafka-Adapter streams
     polled_msgs = st.session_state.kafka_consumer.poll_messages(config.KAFKA_TOPIC_TELEMETRY, limit=10)
     for msg in polled_msgs:
         t_str = msg.get("timestamp_str", time.strftime("%H:%M:%S"))
         src = msg.get("source", "SIMULATION")
         pod_name = msg.get("pod_name")
         
-        # PRINT received messages to terminal as requested
         import json
         print(f"\033[32m[KAFKA-CONSUMER-STDOUT]\033[0m RECV message on topic '{config.KAFKA_TOPIC_TELEMETRY}': {json.dumps(msg)}", flush=True)
         
@@ -440,15 +304,12 @@ def run_fluctuation_step():
             # Map Prometheus metric value back to matching discovered pod if possible
             matched_pod = None
             if pod_name and pod_name not in ["unknown-pod", "generic-stream"]:
-                # 1. Exact match by pod name
                 matched_pod = next((p for p in st.session_state.pods if p["name"] == pod_name), None)
                 
-                # 2. Extract deployment name to look for matching simulated pod to upgrade
                 dep_parts = pod_name.split("-")
                 deployment_name = "-".join(dep_parts[:-2]) if (len(dep_parts) >= 3 and len(dep_parts[-1]) == 5 and dep_parts[-1].isalnum()) else pod_name
                 
                 if not matched_pod:
-                    # Find a simulated pod for the same deployment to dynamically upgrade and rename
                     matched_pod = next((p for p in st.session_state.pods if p["deployment"] == deployment_name and not p.get("is_real", False)), None)
                     if matched_pod:
                         old_name = matched_pod["name"]
@@ -456,7 +317,6 @@ def run_fluctuation_step():
                         matched_pod["is_real"] = True
                         matched_pod["is_kafka_updated"] = True
                         
-                        # Sync rename in stateful k8s_client
                         if 'k8s_client' in st.session_state:
                             k8s_pod = next((p for p in st.session_state.k8s_client.pods if p["name"] == old_name), None)
                             if k8s_pod:
@@ -471,62 +331,46 @@ def run_fluctuation_step():
                 if not matched_pod:
                     matched_pod = next((p for p in st.session_state.pods if pod_name.startswith(p["deployment"]) or p["deployment"].startswith(pod_name)), None)
             
-            # Compute parsed value
+            # Compute parsed CPU / Memory value
+            target_limit = matched_pod.get("cpu_limit", 4.0) if matched_pod else 4.0
             cpu_val = None
             mem_val = None
             if "cpu" in metric_name.lower():
-                cpu_val = min(100.0, max(0.0, metric_value if metric_value > 1.0 else metric_value * 100.0))
+                if metric_value > 100.0 and metric_value <= 10000.0:
+                    cores = metric_value / 1000.0
+                    cpu_val = min(100.0, round((cores / target_limit) * 100.0, 1))
+                elif metric_value <= target_limit and metric_value <= 10.0:
+                    cpu_val = min(100.0, round((metric_value / target_limit) * 100.0, 1))
+                elif metric_value <= 1.0:
+                    cpu_val = round(metric_value * 100.0, 1)
+                else:
+                    cpu_val = min(100.0, max(0.0, round(metric_value, 1)))
             elif "memory" in metric_name.lower() or "rss" in metric_name.lower():
-                # If bytes, convert to MB safely
                 mem_val = round(metric_value / (1024.0 * 1024.0), 1) if metric_value > 1000000 else metric_value
             
-            # Update stateful metric cache in k8s_client
             if 'k8s_client' in st.session_state:
                 st.session_state.k8s_client.update_pod_metrics(pod_name, cpu_pct=cpu_val, memory_mb=mem_val)
                 if matched_pod and matched_pod["name"] != pod_name:
                     st.session_state.k8s_client.update_pod_metrics(matched_pod["name"], cpu_pct=cpu_val, memory_mb=mem_val)
 
             if matched_pod:
-                # Update pod's live metrics from Prometheus!
                 if cpu_val is not None:
                     matched_pod["cpu_pct"] = cpu_val
+                    matched_pod["cpu"] = round((cpu_val / 100.0) * matched_pod.get("cpu_limit", 4.0), 2)
                 if mem_val is not None:
                     matched_pod["memory_mb"] = mem_val
                 matched_pod["is_kafka_updated"] = True
-            elif pod_name and pod_name not in ["unknown-pod", "generic-stream"]:
-                # Register a new K8s pod from Prometheus Kafka Adapter dynamically!
-                final_cpu = cpu_val if cpu_val is not None else 5.0
-                final_mem = mem_val if mem_val is not None else 45.0
                 
-                # Clean deployment name
-                dep_parts = pod_name.split("-")
-                deployment_name = "-".join(dep_parts[:-2]) if (len(dep_parts) >= 3 and len(dep_parts[-1]) == 5 and dep_parts[-1].isalnum()) else pod_name
-                
-                new_pod = {
-                    "name": pod_name,
-                    "namespace": msg.get("namespace", "default"),
-                    "deployment": deployment_name,
-                    "cpu": round((final_cpu / 100.0) * 4.0, 2),
-                    "cpu_pct": final_cpu,
-                    "cpu_limit": 4.0,
-                    "memory_mb": final_mem,
-                    "memory_limit": 1024.0,
-                    "restarts": 0,
-                    "status": "HEALTHY",
-                    "activeProcesses": [{"pid": random.randint(1000, 9999), "user": "prometheus", "cpu": final_cpu, "mem": 1.2, "command": "k8s-container"}],
-                    "creationTime": int(time.time() * 1000),
-                    "replicas": 1,
-                    "isAnomaly": False,
-                    "anomalyScore": 0.95,
-                    "history": [{"cpu_pct": final_cpu, "memory_mb": final_mem, "timestamp": int(time.time() * 1000)}],
-                    "is_real": True,
-                    "type": "k8s_pod",
-                    "is_kafka_updated": True
-                }
-                st.session_state.pods.append(new_pod)
-                if 'k8s_client' in st.session_state:
-                    st.session_state.k8s_client.pods.append(new_pod)
-                log_str = f"[{t_str}] [PROMETHEUS_KAFKA] 🌟 DISCOVERED NEW POD via Kafka: name={pod_name} namespace={msg.get('namespace')}"
+                mem_pct = (matched_pod["memory_mb"] / max(1.0, matched_pod["memory_limit"])) * 100.0
+                if matched_pod["cpu_pct"] >= config.CPU_CRITICAL_THRESHOLD_PCT or mem_pct >= config.MEM_CRITICAL_THRESHOLD_PCT:
+                    matched_pod["status"] = "CRITICAL"
+                elif matched_pod["cpu_pct"] >= config.CPU_WARNING_THRESHOLD_PCT or mem_pct >= config.MEM_WARNING_THRESHOLD_PCT:
+                    matched_pod["status"] = "WARNING"
+                else:
+                    matched_pod["status"] = "HEALTHY"
+                is_anomaly, score = st.session_state.anomaly_detector.analyze_metrics(matched_pod["cpu_pct"], mem_pct)
+                matched_pod["isAnomaly"] = is_anomaly
+                matched_pod["anomalyScore"] = score
                     
         elif msg.get("type") == "sre_platform_telemetry":
             log_str = f"[{t_str}] [{src}] RECV key={pod_name} cpu={msg.get('cpu_pct')}% mem={msg.get('memory_mb')}MB status={msg.get('status')}"
@@ -535,32 +379,10 @@ def run_fluctuation_step():
             mem_val = msg.get("memory_mb")
             status_val = msg.get("status")
             
-            # Update stateful metric cache in k8s_client
             if 'k8s_client' in st.session_state:
                 st.session_state.k8s_client.update_pod_metrics(pod_name, cpu_pct=cpu_val, memory_mb=mem_val, status=status_val)
             
-            # Update matching pods from live SRE stream
             matched_pod = next((p for p in st.session_state.pods if p["name"] == pod_name), None)
-            
-            # Check for simulated pod representing same deployment to upgrade/rename
-            if not matched_pod and pod_name and pod_name not in ["unknown-pod", "generic-stream"]:
-                dep_parts = pod_name.split("-")
-                deployment_name = "-".join(dep_parts[:-2]) if (len(dep_parts) >= 3 and len(dep_parts[-1]) == 5 and dep_parts[-1].isalnum()) else pod_name
-                matched_pod = next((p for p in st.session_state.pods if p["deployment"] == deployment_name and not p.get("is_real", False)), None)
-                if matched_pod:
-                    old_name = matched_pod["name"]
-                    matched_pod["name"] = pod_name
-                    matched_pod["is_real"] = True
-                    matched_pod["is_kafka_updated"] = True
-                    
-                    if 'k8s_client' in st.session_state:
-                        k8s_pod = next((p for p in st.session_state.k8s_client.pods if p["name"] == old_name), None)
-                        if k8s_pod:
-                            k8s_pod["name"] = pod_name
-                            k8s_pod["is_real"] = True
-                            k8s_pod["is_kafka_updated"] = True
-                        if old_name in st.session_state.k8s_client.real_pod_metrics:
-                            st.session_state.k8s_client.real_pod_metrics[pod_name] = st.session_state.k8s_client.real_pod_metrics.pop(old_name)
 
             if matched_pod:
                 if cpu_val is not None:
@@ -570,36 +392,6 @@ def run_fluctuation_step():
                 if status_val is not None:
                     matched_pod["status"] = status_val
                 matched_pod["is_kafka_updated"] = True
-            elif pod_name and pod_name not in ["unknown-pod", "generic-stream"]:
-                # Register new pod from raw telemetry
-                dep_parts = pod_name.split("-")
-                deployment_name = "-".join(dep_parts[:-2]) if (len(dep_parts) >= 3 and len(dep_parts[-1]) == 5 and dep_parts[-1].isalnum()) else pod_name
-                
-                new_pod = {
-                    "name": pod_name,
-                    "namespace": msg.get("namespace", "default"),
-                    "deployment": deployment_name,
-                    "cpu": round((msg.get("cpu_pct", 5.0) / 100.0) * 4.0, 2),
-                    "cpu_pct": msg.get("cpu_pct", 5.0),
-                    "cpu_limit": 4.0,
-                    "memory_mb": msg.get("memory_mb", 45.0),
-                    "memory_limit": 1024.0,
-                    "restarts": 0,
-                    "status": msg.get("status", "HEALTHY"),
-                    "activeProcesses": [{"pid": random.randint(1000, 9999), "user": "sre-agent", "cpu": msg.get("cpu_pct", 5.0), "mem": 1.2, "command": "k8s-container"}],
-                    "creationTime": int(time.time() * 1000),
-                    "replicas": 1,
-                    "isAnomaly": False,
-                    "anomalyScore": 0.95,
-                    "history": [{"cpu_pct": msg.get("cpu_pct", 5.0), "memory_mb": msg.get("memory_mb", 45.0), "timestamp": int(time.time() * 1000)}],
-                    "is_real": True,
-                    "type": "k8s_pod",
-                    "is_kafka_updated": True
-                }
-                st.session_state.pods.append(new_pod)
-                if 'k8s_client' in st.session_state:
-                    st.session_state.k8s_client.pods.append(new_pod)
-                log_str = f"[{t_str}] [KAFKA_STREAM] 🌟 DISCOVERED NEW POD via Kafka: name={pod_name} namespace={msg.get('namespace')}"
         else:
             log_str = f"[{t_str}] [{src}] RECV message on topic={msg.get('topic')} (Raw format)"
             
@@ -618,10 +410,10 @@ def run_fluctuation_step():
             
             # Find valid actions
             valid_actions = []
-            for act in ['scale_up', 'scale_down', 'restart', 'delete_pod', 'kill_process', 'do_nothing']:
-                if act == 'scale_up' and target_pod["replicas"] >= 3:
+            for act in ['force_delete', 'restart', 'scale_up', 'scale_down']:
+                if act == 'scale_up' and target_pod.get("replicas", 1) >= 3:
                     continue
-                if act == 'scale_down' and target_pod["replicas"] <= 1:
+                if act == 'scale_down' and target_pod.get("replicas", 1) <= 1:
                     continue
                 valid_actions.append(act)
                 
@@ -640,6 +432,9 @@ if elapsed >= config.SCRAPE_INTERVAL_SECONDS:
 # EXECUTING REMEDIATION ACTION
 # ==========================================
 def execute_remediation(pod_name: str, action: str, triggered_by: str = "MANUAL"):
+    # Normalize action name
+    q_act = "force_delete" if action in ["force_delete", "delete_pod"] else action
+
     pod = next((p for p in st.session_state.pods if p["name"] == pod_name), None)
     if not pod:
         st.toast(f"Error: Target pod {pod_name} not found.", icon="⚠️")
@@ -651,35 +446,32 @@ def execute_remediation(pod_name: str, action: str, triggered_by: str = "MANUAL"
     
     # 1. Print simulated Kubernetes API server log
     api_log = ""
-    if action == "scale_up":
+    if q_act == "force_delete":
+        old_name = pod["name"]
+        api_log, _ = st.session_state.k8s_client.force_delete_pod(old_name, pod["namespace"])
+        message = f"Force deleted pod {old_name}."
+        if 'deleted_pods' not in st.session_state:
+            st.session_state.deleted_pods = set()
+        st.session_state.deleted_pods.add(old_name)
+        st.session_state.pods = [p for p in st.session_state.pods if p["name"] != old_name]
+        if 'k8s_client' in st.session_state:
+            st.session_state.k8s_client.pods = [p for p in st.session_state.k8s_client.pods if p["name"] != old_name]
+    elif q_act == "scale_up":
         api_log = st.session_state.k8s_client.scale_deployment(pod["deployment"], 3, pod["namespace"])
         message = f"Scaled deployment '{pod['deployment']}' horizontally to 3 replicas. Load balanced successfully."
-    elif action == "scale_down":
+        pod["is_stressed"] = False
+        pod["status"] = "HEALTHY"
+    elif q_act == "scale_down":
         api_log = st.session_state.k8s_client.scale_deployment(pod["deployment"], 1, pod["namespace"])
         message = f"Scaled deployment '{pod['deployment']}' down to 1 baseline replica."
-    elif action == "restart":
+    elif q_act == "restart":
         api_log = st.session_state.k8s_client.rollout_restart(pod["deployment"], pod["namespace"])
         message = f"rollout restart completed for {pod['deployment']}. Active thread buffers flushed."
-    elif action == "delete_pod":
-        old_name = pod["name"]
-        api_log = st.session_state.k8s_client.delete_pod(old_name, pod["namespace"])
-        message = f"Terminated old pod {old_name}. K8s replica controller provisioned replacement instance."
-    elif action == "kill_process":
-        # Find this pod inside k8s_client
-        k8s_pod = next((p for p in st.session_state.k8s_client.pods if p["name"] == pod["name"]), None)
-        if "smart-kitchen" in pod["deployment"]:
-            api_log = st.session_state.k8s_client.exec_container_kill(pod["name"], pod["namespace"], "kitchen-hub", "java")
-            message = f"Sent SIGKILL to PID 1 java binary in {pod['name']}. Triggered immediate container panic rollout."
-        elif k8s_pod and any("stress" in p["command"] for p in k8s_pod.get("activeProcesses", [])):
-            api_log = st.session_state.k8s_client.exec_container_kill(pod["name"], pod["namespace"], "stress-agent", "stress")
-            message = "Terminated rogue stress tool execution thread inside the container. Core CPU levels returned to normal."
-        else:
-            api_log = f"Exec shell: process 'stress' not found in pod {pod['name']}."
-            message = "Remediation action had no effect; no rogue stress tool runs detected."
-            success = False
-    elif action == "do_nothing":
-        api_log = "API standby. Telemetry check only."
-        message = "Standing by. System continued alerting cycles."
+        pod["is_stressed"] = False
+        pod["cpu_pct"] = 12.0
+        pod["memory_mb"] = 35.0
+        pod["status"] = "HEALTHY"
+        pod["activeProcesses"] = [{"pid": random.randint(100, 999), "user": "app", "cpu": 1.2, "mem": 2.5, "command": f"{pod['deployment']}-service"}]
 
     # Clear discovery cache & immediately scrape fresh state
     st.session_state.discovery_engine.clear_cache()
@@ -702,43 +494,39 @@ def execute_remediation(pod_name: str, action: str, triggered_by: str = "MANUAL"
     if success:
         cpu_val = pod.get("cpu_pct", 0.0)
         mem_val = (pod.get("memory_mb", 0.0) / max(1.0, pod.get("memory_limit", 512.0))) * 100.0
-        has_stress = any("stress" in p["command"] for p in pod.get("activeProcesses", []))
         
-        if cpu_val > 70.0 or has_stress:
-            # CPU Issue or stress binary running
-            if action == "kill_process":
+        if cpu_val > 70.0:
+            if q_act == "scale_up":
                 reward = 12
-                message += " [SRE OPTIMIZED] Process stressor safely terminated!"
-            elif action == "scale_up":
+                message += " [SRE OPTIMIZED] Scaled out replicas to cushion load."
+            elif q_act == "force_delete":
+                reward = 8
+                message += " [SRE REPLACED] Force deleted pod for clean replacement instance."
+            elif q_act == "restart":
                 reward = 6
-                message += " [SRE OK] Scaled out replicas to cushion load."
-            elif action in ["restart", "delete_pod"]:
-                reward = 4
-                message += " [SRE AGGRESSIVE] Pod restarted to shed thread locks."
+                message += " [SRE RESTARTED] Rollout restarted deployment to clear load."
             else:
                 reward = -5
         elif mem_val > 80.0:
-            # Memory leakage issue
-            if action in ["restart", "delete_pod"]:
+            if q_act in ["restart", "force_delete"]:
                 reward = 12
-                message += " [SRE OPTIMIZED] Recycled pod memory footprint."
-            elif action == "scale_up":
-                reward = 3
+                message += " [SRE OPTIMIZED] Recycled pod memory footprint & cleared leak."
+            elif q_act == "scale_up":
+                reward = 4
                 message += " [SRE BUFFER] Scale up added temporary memory overhead."
             else:
                 reward = -5
         else:
-            # Nominal, healthy state
-            if action == "do_nothing":
-                reward = 12
+            if q_act == "force_delete":
+                reward = 10
+            elif q_act == "restart":
+                reward = 8
             else:
-                reward = -5  # Penalize disruptive or wasteful remediation on healthy nodes
-    else:
-        reward = -5
+                reward = 2
 
     # Update Q-Learning weights table
     next_state_key = st.session_state.rl_optimizer.get_state_key(pod)
-    new_q = st.session_state.rl_optimizer.update_q_value(prev_state_key, action, reward, next_state_key)
+    new_q = st.session_state.rl_optimizer.update_q_value(prev_state_key, q_act, reward, next_state_key)
     
     # Epsilon decay
     if st.session_state.epsilon > 0.05:
@@ -820,6 +608,7 @@ def purge_simulator_state():
     st.session_state.rl_optimizer.q_table = {}
     st.session_state.ai_recs_cache = {}
     st.session_state.kafka_msg_log = []
+    st.session_state.deleted_pods = set()
     
     st.session_state.k8s_client = KubernetesClientSimulator()
     st.session_state.pods = st.session_state.discovery_engine.discover_active_pods([])
@@ -904,12 +693,7 @@ with st.sidebar:
         
     loop_enabled = st.checkbox("Scrape Loop (3s)", value=True, help="Simulate real-time prometheus queries")
     
-    st.markdown("---")
-    st.markdown("### 📊 Policy Hyperparameters")
-    st.session_state.epsilon = st.slider("Exploration Rate (ε)", 0.0, 1.0, float(st.session_state.epsilon), 0.05)
-    st.markdown(f"**Discount Factor (γ):** `{config.RL_DISCOUNT_FACTOR}`")
-    st.markdown(f"**Learning Rate (α):** `{config.RL_LEARNING_RATE}`")
-    st.markdown(f"**Scraped Telemetry Count:** `{st.session_state.total_steps}`")
+
     
     st.markdown("---")
     st.markdown("### 🛠️ Danger Zone")
@@ -1011,17 +795,6 @@ tab_telemetry, tab_remediation, tab_rl = st.tabs([
 with tab_telemetry:
     st.markdown("### Kubernetes Discovered Pods Node Grid")
     
-    # Informational notice about kubectl top / Metrics API
-    st.markdown("""
-        <div style="background-color: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 10px 16px; margin-bottom: 16px; font-size: 13px; color: #8b949e; display: flex; align-items: center; justify-content: space-between;">
-            <div>
-                <span style="color: #00e5ff; font-weight: bold; font-family: monospace;">ℹ️ METRICS API COMPATIBILITY:</span>
-                If <code>kubectl top pod</code> returns <i>"error: Metrics API not available"</i> on your local cluster, this platform seamlessly scrapes container cAdvisor and kernel process metrics directly.
-            </div>
-            <span style="background-color: #21262d; border: 1px solid #30363d; color: #39ff14; padding: 2px 8px; border-radius: 4px; font-family: monospace; font-size: 11px;">AUTO SCRAPE ACTIVE</span>
-        </div>
-    """, unsafe_allow_html=True)
-    
     # 2x2 grid for discovered pods
     p_cols = st.columns(4)
     for idx, pod in enumerate(st.session_state.pods):
@@ -1053,9 +826,10 @@ with tab_telemetry:
                         <span style="font-size: 12px; background-color: #21262d; border: 1px solid #30363d; padding: 4px 10px; border-radius: 6px; font-family: monospace; color: #8b949e;">{pod['namespace']}</span>
                         <strong style="color: {status_color}; font-size: 12px; text-transform: uppercase; border: 1px solid {status_color}50; padding: 3px 8px; border-radius: 12px; background-color: {status_color}10; white-space: nowrap; max-width: 150px; overflow: hidden; text-overflow: ellipsis;" title="{full_status}">{full_status}</strong>
                     </div>
-                    <div style="margin-bottom: 16px; height: 65px; overflow: hidden;">
-                        <h4 style="margin: 0; font-size: 16px; color: #f0f6fc; text-overflow: ellipsis; white-space: nowrap;" title="{pod['name']}">{pod['name']}</h4>
-                        <span style="font-size: 12px; color: #8b949e;">Deployment: <strong style="color: #c9d1d9;">{pod['deployment']}</strong></span>
+                    <div style="margin-bottom: 14px;">
+                        <h4 style="margin: 0 0 4px 0; font-size: 15px; color: #f0f6fc; text-overflow: ellipsis; white-space: nowrap; overflow: hidden;" title="{pod['name']}">{pod['name']}</h4>
+                        <div style="font-size: 12px; color: #8b949e; margin-bottom: 2px;">Deployment: <strong style="color: #c9d1d9;">{pod['deployment']}</strong></div>
+                        <div style="font-size: 12px; color: #8b949e;">Pod Status: <strong style="color: {status_color}; font-weight: bold; background-color: {status_color}15; padding: 2px 6px; border-radius: 4px; border: 1px solid {status_color}40;">{full_status}</strong></div>
                     </div>
                     
                     <!-- CPU Metric Gauge -->
@@ -1133,14 +907,9 @@ with tab_telemetry:
             # Button layouts
             b_col1, b_col2 = st.columns(2)
             with b_col1:
-                if pod["status"] == "HEALTHY":
-                    if st.button("🔥 Stress Load", key=f"t-stress-{pod['name']}", help="Inject heavy stress loads"):
-                        inject_chaos_load(pod["name"])
-                        st.rerun()
-                else:
-                    if st.button("⚡ Quick Heal", key=f"t-heal-{pod['name']}", help="Trigger rapid container restart"):
-                        execute_remediation(pod["name"], "restart")
-                        st.rerun()
+                if st.button("🔄 Restart Pod", key=f"t-restart-{pod['name']}", help="Trigger container restart"):
+                    execute_remediation(pod["name"], "restart")
+                    st.rerun()
             with b_col2:
                 if st.button("🔍 Diagnose", key=f"t-diag-{pod['name']}", help="Analyze processes & logs"):
                     st.session_state.selected_pod_name = pod["name"]
@@ -1250,7 +1019,7 @@ with tab_remediation:
         st.markdown("### 🛠️ Interactive Remediation Execution Matrix")
         
         target_remedy_pod_name = st.selectbox(
-            "Select K8s Pod to Target for Manual Policy Action:",
+            "Select K8s Pod to Target for Policy Action:",
             options=[p["name"] for p in st.session_state.pods],
             key="remedy_target_selector"
         )
@@ -1259,135 +1028,115 @@ with tab_remediation:
         if target_remedy_pod:
             st.markdown(f"**Target Pod Specs:** `{target_remedy_pod['name']}` • Namespace: `{target_remedy_pod['namespace']}` • Deployment: `{target_remedy_pod['deployment']}`")
             
-            # Action button matrix grid
-            act_cols = st.columns(3)
+            # Action button matrix grid - 4 core K8s SRE actions
+            act_cols = st.columns(2)
             with act_cols[0]:
-                if st.button("⚡ Horizontal Scale (Up 3x)", width='stretch', help="Scale deployment up to 3 replicas"):
+                if st.button("🗑️ Force Delete Pod", width='stretch', help="Immediately delete pod instance and trigger replica replacement"):
+                    execute_remediation(target_remedy_pod_name, "force_delete")
+                    st.rerun()
+                if st.button("⚡ Scale Up (3x)", width='stretch', help="Scale deployment up to 3 replicas"):
                     execute_remediation(target_remedy_pod_name, "scale_up")
                     st.rerun()
-                if st.button("🔌 rollout restart", width='stretch', help="Re-roll active pod instances"):
+            with act_cols[1]:
+                if st.button("🔌 Rollout Restart", width='stretch', help="Rollout restart deployment instances"):
                     execute_remediation(target_remedy_pod_name, "restart")
                     st.rerun()
-            with act_cols[1]:
-                if st.button("📉 Horizontal Scale (Down 1x)", width='stretch', help="Scale back down to 1 instance"):
+                if st.button("📉 Scale Down (1x)", width='stretch', help="Scale deployment down to 1 baseline replica"):
                     execute_remediation(target_remedy_pod_name, "scale_down")
                     st.rerun()
-                if st.button("🗑️ Force Delete Pod", width='stretch', help="Immediately delete pod instance"):
-                    execute_remediation(target_remedy_pod_name, "delete_pod")
-                    st.rerun()
-            with act_cols[2]:
-                if st.button("☠️ Kill stress/java", width='stretch', help="Force kill specific stress/java execution binaries"):
-                    execute_remediation(target_remedy_pod_name, "kill_process")
-                    st.rerun()
-                if st.button("🤷 Standing By (Do Nothing)", width='stretch', help="Acknowledge alert but stand by"):
-                    execute_remediation(target_remedy_pod_name, "do_nothing")
-                    st.rerun()
 
-            st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
-            st.markdown("#### 🧪 Direct Pod State Simulator Controls")
-            state_cols = st.columns(4)
-            with state_cols[0]:
-                if st.button("🟢 State: Running", width='stretch', help="Set pod state to Running (Healthy)"):
-                    target_remedy_pod["status"] = "HEALTHY"
-                    target_remedy_pod["cpu_pct"] = 12.0
-                    target_remedy_pod["memory_mb"] = 35.0
-                    target_remedy_pod["isAnomaly"] = False
-                    target_remedy_pod["activeProcesses"] = [{"pid": random.randint(100, 999), "user": "app", "cpu": 1.2, "mem": 2.5, "command": "app-server"}]
-                    if 'k8s_client' in st.session_state:
-                        k8s_p = next((p for p in st.session_state.k8s_client.pods if p["name"] == target_remedy_pod_name), None)
-                        if k8s_p:
-                            k8s_p["status"] = "HEALTHY"
-                            k8s_p["cpu_pct"] = 12.0
-                            k8s_p["memory_mb"] = 35.0
-                    st.toast(f"Set state of {target_remedy_pod_name} to RUNNING", icon="🟢")
-                    st.rerun()
-            with state_cols[1]:
-                if st.button("🔴 State: Stopped", width='stretch', help="Set pod state to Stopped"):
-                    target_remedy_pod["status"] = "STOPPED"
-                    target_remedy_pod["cpu_pct"] = 0.0
-                    target_remedy_pod["memory_mb"] = 0.0
-                    target_remedy_pod["activeProcesses"] = []
-                    if 'k8s_client' in st.session_state:
-                        k8s_p = next((p for p in st.session_state.k8s_client.pods if p["name"] == target_remedy_pod_name), None)
-                        if k8s_p:
-                            k8s_p["status"] = "STOPPED"
-                            k8s_p["cpu_pct"] = 0.0
-                            k8s_p["memory_mb"] = 0.0
-                    st.toast(f"Set state of {target_remedy_pod_name} to STOPPED", icon="🔴")
-                    st.rerun()
-            with state_cols[2]:
-                if st.button("⚠️ State: Image Pull Error", width='stretch', help="Set pod state to Error in image pulling"):
-                    target_remedy_pod["status"] = "Error in image pulling"
-                    target_remedy_pod["cpu_pct"] = 0.0
-                    target_remedy_pod["memory_mb"] = 0.0
-                    target_remedy_pod["activeProcesses"] = [{"pid": 0, "user": "kubelet", "cpu": 0.0, "mem": 0.0, "command": "ErrImagePull: rpc error: image pull failed"}]
-                    if 'k8s_client' in st.session_state:
-                        k8s_p = next((p for p in st.session_state.k8s_client.pods if p["name"] == target_remedy_pod_name), None)
-                        if k8s_p:
-                            k8s_p["status"] = "Error in image pulling"
-                            k8s_p["cpu_pct"] = 0.0
-                            k8s_p["memory_mb"] = 0.0
-                    st.toast(f"Set state of {target_remedy_pod_name} to ERR_IMAGE_PULL", icon="⚠️")
-                    st.rerun()
-            with state_cols[3]:
-                if st.button("🔥 Inject Process Load", width='stretch', help="Inject heavy CPU/Memory process load"):
-                    inject_chaos_load(target_remedy_pod_name)
-                    st.rerun()
+            st.markdown("<div style='height: 15px;'></div>", unsafe_allow_html=True)
+            st.markdown("### 📊 Active Q-Learning Policy Table (Q-Table)")
+            st.markdown("Q-Table policy rewards and action weights for states: `force_delete`, `restart`, `scale_up`, `scale_down`.")
+            
+            # Draw Q-Table directly in Remediation Tab
+            q_table_data = []
+            for state_key, actions_dict in st.session_state.rl_optimizer.q_table.items():
+                row_dict = {"SRE Telemetry State": state_key}
+                for act in ['force_delete', 'restart', 'scale_up', 'scale_down']:
+                    row_dict[act] = actions_dict.get(act, 0.0)
+                q_table_data.append(row_dict)
+                
+            if q_table_data:
+                q_df = pd.DataFrame(q_table_data)
+                st.dataframe(q_df, hide_index=True, width='stretch', height=220)
+            else:
+                sample_states = [
+                    {"SRE Telemetry State": "water_high_cpu_ok_mem", "force_delete": 8.0, "restart": 6.0, "scale_up": 12.0, "scale_down": -5.0},
+                    {"SRE Telemetry State": "kitchen_med_cpu_high_mem", "force_delete": 12.0, "restart": 12.0, "scale_up": 4.0, "scale_down": -5.0},
+                    {"SRE Telemetry State": "traffic_ok_cpu_ok_mem", "force_delete": 10.0, "restart": 8.0, "scale_up": 2.0, "scale_down": 2.0}
+                ]
+                q_df = pd.DataFrame(sample_states)
+                st.dataframe(q_df, hide_index=True, width='stretch', height=180)
+                st.info("Q-Table initialized with baseline heuristics. Live remediation actions will update Q-values above in real time.")
 
     with rem_col2:
-        st.markdown("### 🧠 SRE Diagnostic Advisor (Groq Llama-3.3)")
-        st.markdown("AI-Copilot reviews active cAdvisor telemetry arrays and container process profiles to produce exact remedial commands.")
+        st.markdown("### 🧠 SRE Diagnostic Advisor & Q-Table Ranked Recommendations")
+        st.markdown("AI Recommendations are dynamically ranked based on the selected pod's real-time telemetry state and Q-Learning policy table.")
         
         ai_target_pod_name = st.selectbox(
-            "Select targeted container pod to retrieve AI recipe:",
+            "Select targeted container pod to retrieve Q-table ranked recipes:",
             options=[p["name"] for p in st.session_state.pods],
             key="ai_target_selector"
         )
         ai_target_pod = next((p for p in st.session_state.pods if p["name"] == ai_target_pod_name), None)
         
         if ai_target_pod:
-            if st.button("🔮 Ask Groq Copilot", help="Query Groq SRE diagnostic API"):
-                with st.spinner("Analyzing container telemetry logs, CPU metrics, memory blocks, and active process matrices..."):
-                    # Pull recommendations
+            if st.button("🔮 Ask Groq Copilot & Refresh Q-Rankings", help="Query Groq SRE diagnostic API and map to Q-Table"):
+                with st.spinner("Analyzing container telemetry logs, CPU metrics, and Q-Table policy weights..."):
                     recs = st.session_state.groq_agent.get_recommendations(ai_target_pod)
                     st.session_state.ai_recs_cache[ai_target_pod["name"]] = recs
                     st.session_state.ai_queries_count += 1
-                    
-            # Pull from cache if exists
-            cached_recs = st.session_state.ai_recs_cache.get(ai_target_pod["name"], None)
-            if cached_recs:
-                st.markdown("#### Structured Remediation Prescriptions:")
-                for rec in cached_recs:
-                    rank = rec.get("rank", 1)
-                    action = rec.get("action", "restart").replace("_", " ").upper()
-                    impact = rec.get("impact", "medium").upper()
-                    reason = rec.get("reason", "")
-                    cmd = rec.get("kubectl_command", "")
-                    
-                    impact_color = "#f85149" if impact == "HIGH" else "#d29922" if impact == "MEDIUM" else "#58a6ff"
-                    
-                    st.markdown(clean_html(f"""
-                        <div style="background-color: #161b22; border: 1px solid #30363d; border-radius: 10px; padding: 18px; margin-bottom: 14px;">
-                            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
-                                <strong style="color: #00e5ff; font-family: monospace; font-size: 16px;">#{rank} REMEDY: {action}</strong>
-                                <span style="font-size: 11px; font-weight: bold; font-family: monospace; border: 1px solid {impact_color}; color: {impact_color}; padding: 3px 8px; border-radius: 6px; background-color: rgba(0,0,0,0.15);">
-                                    {impact} IMPACT
-                                </span>
+            
+            # Retrieve or generate base recommendations
+            base_recs = st.session_state.ai_recs_cache.get(ai_target_pod["name"], None)
+            if not base_recs:
+                base_recs = st.session_state.groq_agent.get_recommendations(ai_target_pod)
+                st.session_state.ai_recs_cache[ai_target_pod["name"]] = base_recs
+                
+            # Rank recommendations using Q-Table for individual target pod
+            ranked_recs = st.session_state.groq_agent.rank_recommendations(
+                ai_target_pod, base_recs, st.session_state.rl_optimizer
+            )
+            
+            target_state_key = st.session_state.rl_optimizer.get_state_key(ai_target_pod)
+            st.markdown(f"#### 🏆 Ranked Remediation Prescriptions for `{ai_target_pod['name']}` (State: `{target_state_key}`):")
+            
+            for rec in ranked_recs:
+                rank = rec.get("rank", 1)
+                action = rec.get("action", "restart").replace("_", " ").upper()
+                impact = rec.get("impact", "medium").upper()
+                reason = rec.get("reason", "")
+                cmd = rec.get("kubectl_command", "")
+                q_score = rec.get("q_score", 0.0)
+                
+                impact_color = "#f85149" if impact == "HIGH" else "#d29922" if impact == "MEDIUM" else "#58a6ff"
+                rank_lbl = "🏆 RANK #1 (BEST REMEDY)" if rank == 1 else f"RANK #{rank}"
+                rank_color = "#39ff14" if rank == 1 else "#00e5ff"
+                
+                st.markdown(clean_html(f"""
+                    <div style="background-color: #161b22; border: 1px solid #30363d; border-radius: 10px; padding: 18px; margin-bottom: 14px;">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                            <div>
+                                <strong style="color: {rank_color}; font-family: monospace; font-size: 15px;">{rank_lbl}: {action}</strong>
+                                <span style="font-size: 12px; color: #39ff14; font-family: monospace; margin-left: 10px; font-weight: bold;">[Q-Score: {q_score:+.1f}]</span>
                             </div>
-                            <p style="margin: 0; font-size: 14px; color: #c9d1d9;">{reason}</p>
-                            <div style="margin-top: 10px; font-family: monospace; font-size: 13px; background-color: #0d1117; padding: 10px; border-radius: 6px; border: 1px solid #21262d; color: #58a6ff;">
-                                {cmd}
-                            </div>
+                            <span style="font-size: 11px; font-weight: bold; font-family: monospace; border: 1px solid {impact_color}; color: {impact_color}; padding: 3px 8px; border-radius: 6px; background-color: rgba(0,0,0,0.15);">
+                                {impact} IMPACT
+                            </span>
                         </div>
-                    """), unsafe_allow_html=True)
-                    
-                    # Direct click healing button
-                    raw_act = rec.get("action", "do_nothing")
-                    if st.button(f"Apply Remedy #{rank}: {raw_act.replace('_', ' ').title()}", key=f"apply-{rank}-{ai_target_pod['name']}"):
-                        execute_remediation(ai_target_pod["name"], raw_act, "AI_COPILOT")
-                        st.rerun()
-            else:
-                st.info("No active diagnostic recipe generated for this pod. Query the Groq Advisor above to generate recipes.")
+                        <p style="margin: 0; font-size: 14px; color: #c9d1d9;">{reason}</p>
+                        <div style="margin-top: 10px; font-family: monospace; font-size: 13px; background-color: #0d1117; padding: 10px; border-radius: 6px; border: 1px solid #21262d; color: #58a6ff;">
+                            {cmd}
+                        </div>
+                    </div>
+                """), unsafe_allow_html=True)
+                
+                # Direct click healing button
+                raw_act = rec.get("action", "restart")
+                if st.button(f"Apply Rank #{rank}: {raw_act.replace('_', ' ').title()} (Q: {q_score:+.1f})", key=f"apply-{rank}-{ai_target_pod['name']}"):
+                    execute_remediation(ai_target_pod["name"], raw_act, "AI_COPILOT")
+                    st.rerun()
 
 # ==========================================
 # WINDOW 3: RL POLICY INSIGHTS & CONFIGURATION
@@ -1405,7 +1154,7 @@ with tab_rl:
         q_table_data = []
         for state_key, actions_dict in st.session_state.rl_optimizer.q_table.items():
             row_dict = {"SRE Telemetry State": state_key}
-            for act in ACTIONS:
+            for act in ['force_delete', 'restart', 'scale_up', 'scale_down']:
                 row_dict[act] = actions_dict.get(act, 0.0)
             q_table_data.append(row_dict)
             
@@ -1413,15 +1162,14 @@ with tab_rl:
             q_df = pd.DataFrame(q_table_data)
             st.dataframe(q_df, hide_index=True, width='stretch', height=220)
         else:
-            # Seed state visual table
             sample_states = [
-                {"SRE Telemetry State": "traffic_high_cpu_ok_mem", "scale_up": 12.0, "scale_down": -5.0, "restart": -2.0, "delete_pod": -2.0, "kill_process": -10.0, "do_nothing": -5.0},
-                {"SRE Telemetry State": "kitchen_med_cpu_high_mem", "scale_up": -3.0, "scale_down": -5.0, "restart": 10.0, "delete_pod": 10.0, "kill_process": 2.0, "do_nothing": -5.0},
-                {"SRE Telemetry State": "water_high_cpu_ok_mem", "scale_up": -4.0, "scale_down": -5.0, "restart": 4.0, "delete_pod": 4.0, "kill_process": 12.0, "do_nothing": -5.0}
+                {"SRE Telemetry State": "water_high_cpu_ok_mem", "force_delete": 8.0, "restart": 6.0, "scale_up": 12.0, "scale_down": -5.0},
+                {"SRE Telemetry State": "kitchen_med_cpu_high_mem", "force_delete": 12.0, "restart": 12.0, "scale_up": 4.0, "scale_down": -5.0},
+                {"SRE Telemetry State": "traffic_ok_cpu_ok_mem", "force_delete": 10.0, "restart": 8.0, "scale_up": 2.0, "scale_down": 2.0}
             ]
             q_df = pd.DataFrame(sample_states)
             st.dataframe(q_df, hide_index=True, width='stretch', height=180)
-            st.info("Optimizer has not learned custom states in this session yet. System is using baseline SRE heuristics.")
+            st.info("Optimizer has initialized baseline SRE state vectors.")
             
         st.markdown("---")
         st.markdown("#### 🧪 Autonomous SRE Policy Logs")
@@ -1475,7 +1223,7 @@ with tab_rl:
         st.markdown("<div style='height: 15px;'></div>", unsafe_allow_html=True)
         
         st.markdown("#### Live Telemetry Metrics")
-        st.metric(label="Exploration Rate (Epsilon Decayed)", value=f"{st.session_state.epsilon:.3f}")
+
         st.metric(label="Groq LLM Queries Executed", value=st.session_state.ai_queries_count)
         st.metric(label="Continuous Scrape Step", value=st.session_state.total_steps)
 

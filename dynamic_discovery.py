@@ -44,7 +44,7 @@ class ClusterDiscoveryEngine:
         infra_keywords = [
             "prometheus", "sre-kafka", "kafka", "zookeeper", "alertmanager", "node-exporter",
             "pushgateway", "kube-state-metrics", "kafka-adapter", "coredns", "kube-proxy",
-            "kube-apiserver", "kube-controller-manager", "kube-scheduler", "etcd", "kindest", "minikube" , "kube"
+            "kube-apiserver", "kube-controller-manager", "kube-scheduler", "etcd", "kindest", "minikube"
         ]
         if any(kw in name_lower for kw in infra_keywords):
             return True
@@ -82,13 +82,12 @@ class ClusterDiscoveryEngine:
                         ns, name, status = parts[0], parts[1], parts[2]
                         if self.is_infra_pod(name, ns):
                             continue
-                        if(status=="Running"):
-                            containers.append({
-                                "id": name,
-                                "name": name,
-                                "image": "k8s-image:latest",
-                                "status": status
-                            })
+                        containers.append({
+                            "id": name,
+                            "name": name,
+                            "image": "k8s-image:latest",
+                            "status": status
+                        })
                 return containers
 
             containers = []
@@ -101,13 +100,12 @@ class ClusterDiscoveryEngine:
                     ns, name, image, status = parts[0], parts[1], parts[2], parts[3]
                     if self.is_infra_pod(name, ns):
                         continue
-                    if(status=="Running"):
-                        containers.append({
-                            "id": name,
-                            "name": name,
-                            "image": image.rstrip(","),
-                            "status": status
-                        })
+                    containers.append({
+                        "id": name,
+                        "name": name,
+                        "image": image.rstrip(","),
+                        "status": status
+                    })
             return containers
         except Exception:
             return []
@@ -139,11 +137,10 @@ class ClusterDiscoveryEngine:
                             cpu_cores = float(cpu_str.replace("m", "")) / 1000.0
                         else:
                             cpu_cores = float(cpu_str)
-                        cpu_pct = (cpu_cores / 4.0) * 100.0
                     except ValueError:
-                        cpu_pct = 2.0
+                        cpu_cores = 0.0
                     
-                    mem_mb = 25.0
+                    mem_mb = 0.0
                     mem_limit = 1024.0
                     try:
                         if mem_str.endswith("Mi"):
@@ -155,10 +152,11 @@ class ClusterDiscoveryEngine:
                         else:
                             mem_mb = float(mem_str)
                     except ValueError:
-                        mem_mb = 25.0
+                        mem_mb = 0.0
                         
                     stats[name] = {
-                        "cpu_pct": round(cpu_pct, 1),
+                        "cpu_cores": round(cpu_cores, 3),
+                        "cpu_pct": round((cpu_cores / 4.0) * 100.0, 1),
                         "memory_mb": round(mem_mb, 1),
                         "memory_limit": mem_limit
                     }
@@ -230,7 +228,6 @@ class ClusterDiscoveryEngine:
                     if not line:
                         continue
                     # Split fields: UID, PID, PPID, C, STIME, TTY, TIME, CMD
-                    # Max split 7 to keep the entire command intact at the end
                     parts = line.split(None, 7)
                     if len(parts) >= 8:
                         processes.append(
@@ -238,12 +235,12 @@ class ClusterDiscoveryEngine:
                                 "pid": (
                                     int(parts[1])
                                     if parts[1].isdigit()
-                                    else random.randint(10, 999)
+                                    else 0
                                 ),
                                 "user": parts[0],
-                                "cpu": round(random.uniform(0.1, 2.5), 1),
-                                "mem": round(random.uniform(0.5, 4.0), 1),
-                                "command": parts[-1],  # Contains the full path/args
+                                "cpu": 0.0,
+                                "mem": 0.0,
+                                "command": parts[-1],
                             }
                         )
             return processes

@@ -99,9 +99,15 @@ class TelemetryConsumerSimulator:
                                 
                             normalized["labels"] = payload.get("labels", {})
                             
-                            # Safely extract pod identity and namespace from Labels
+                            # Safely extract pod identity from multiple Prometheus label key variants
                             labels = payload.get("labels", {})
-                            normalized["pod_name"] = labels.get("pod", labels.get("container", labels.get("kubernetes_pod_name", "unknown-pod")))
+                            pod_id = labels.get("pod") or labels.get("pod_name") or labels.get("kubernetes_pod_name")
+                            
+                            # Skip metrics without pod-level identity (node/infrastructure metrics)
+                            if not pod_id or pod_id in ("POD", ""):
+                                continue
+                            
+                            normalized["pod_name"] = pod_id
                             normalized["namespace"] = labels.get("namespace", labels.get("kubernetes_namespace", "default"))
                         
                         # Case 2: Custom SRE platform telemetry

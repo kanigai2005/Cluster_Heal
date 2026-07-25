@@ -11,7 +11,6 @@ try:
 except ImportError:
     KAFKA_AVAILABLE = False
 
-# Simulating Prometheus scrape to Kafka producer pipeline
 class TelemetryProducerSimulator:
     def __init__(self, bootstrap_servers: str = "localhost:9092"):
         self.servers = bootstrap_servers

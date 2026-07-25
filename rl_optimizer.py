@@ -5,7 +5,7 @@ import requests
 from typing import Dict, List, Tuple
 from config import GEMINI_API_KEY, GROQ_API_KEY, RL_LEARNING_RATE, RL_DISCOUNT_FACTOR
 
-ACTIONS = ['scale_up', 'scale_down', 'restart', 'delete_pod', 'kill_process', 'do_nothing']
+ACTIONS = ['force_delete', 'restart', 'scale_up', 'scale_down']
 
 class QLearningOptimizer:
     def __init__(self):
@@ -16,13 +16,14 @@ class QLearningOptimizer:
         self.actions = ACTIONS
 
     def get_state_key(self, pod: Dict) -> str:
-        cpu_pct = pod["cpu_pct"]
+        cpu_pct = pod.get("cpu_pct", 0.0)
         cpu_level = "high_cpu" if cpu_pct > 90 else "med_cpu" if cpu_pct > 70 else "ok_cpu"
         
-        mem_pct = (pod["memory_mb"] / pod["memory_limit"]) * 100
+        mem_limit = max(1.0, pod.get("memory_limit", 512.0))
+        mem_pct = (pod.get("memory_mb", 0.0) / mem_limit) * 100
         mem_level = "high_mem" if mem_pct > 85 else "ok_mem"
         
-        dev = pod["deployment"].lower()
+        dev = pod.get("deployment", "service").lower()
         if "camera" in dev or "traffic" in dev:
             type_key = "traffic"
         elif "water" in dev or "sensor" in dev:
@@ -44,7 +45,7 @@ class QLearningOptimizer:
         Epsilon-greedy policy for action selection.
         """
         if not valid_actions:
-            return 'do_nothing'
+            return 'restart'
             
         if random.random() < epsilon:
             return random.choice(valid_actions)
@@ -60,10 +61,12 @@ class QLearningOptimizer:
 
     def update_q_value(self, state: str, action: str, reward: float, next_state: str) -> float:
         q_vals = self.get_q_values(state)
+        if action not in q_vals:
+            q_vals[action] = 0.0
         old_q = q_vals[action]
         
         next_q_vals = self.get_q_values(next_state)
-        max_next_q = max(next_q_vals.values())
+        max_next_q = max(next_q_vals.values()) if next_q_vals else 0.0
         
         # Bellman update
         new_q = old_q + RL_LEARNING_RATE * (reward + RL_DISCOUNT_FACTOR * max_next_q - old_q)
@@ -84,26 +87,13 @@ class GroqSREAgent:
     def get_recommendations(self, pod: Dict) -> List[Dict]:
         """
         Fetches structured recommendations from Groq.
-        If pod is HEALTHY, returns 'no changes required'.
-        If pod is UNHEALTHY (CRITICAL, WARNING, STOPPED, ErrImagePull), passes pod state and internal process state to Groq.
+        Passes pod state and internal process state to Groq.
         """
         status = pod.get("status", "HEALTHY")
         cpu_pct = pod.get("cpu_pct", 0.0)
         mem_limit = max(1.0, pod.get("memory_limit", 512.0))
         mem_pct = (pod.get("memory_mb", 0.0) / mem_limit) * 100.0
         is_anomaly = pod.get("isAnomaly", False)
-
-        # Check if pod is Healthy
-        if status in ["HEALTHY", "Running"] and cpu_pct < 70.0 and mem_pct < 70.0 and not is_anomaly:
-            return [
-                {
-                    "rank": 1,
-                    "action": "do_nothing",
-                    "reason": f"No changes required. Pod '{pod['name']}' is HEALTHY and running smoothly within normal SLA limits.",
-                    "kubectl_command": f"kubectl get pod {pod['name']} -n {pod['namespace']}",
-                    "impact": "low"
-                }
-            ]
 
         process_str = "\n".join(
             f"PID {p['pid']} [{p['user']}]: CPU {p['cpu']}%, Mem {p['mem']}% -> {p['command']}"
@@ -132,7 +122,7 @@ class GroqSREAgent:
         An array of objects, each containing:
         {{
           "rank": number (1, 2, or 3),
-          "action": string (MUST be one of: "scale_up", "scale_down", "restart", "delete_pod", "kill_process", "do_nothing"),
+          "action": string (MUST be one of: "force_delete", "restart", "scale_up", "scale_down"),
           "reason": string (a concise, detailed technical explanation analyzing the process/state, max 150 chars),
           "kubectl_command": string (exact kubectl command, e.g. "kubectl scale deployment {pod['deployment']} --replicas=3 -n {pod['namespace']}"),
           "impact": string ("high", "medium", or "low")
@@ -177,50 +167,20 @@ class GroqSREAgent:
         name = pod.get("name", "pod")
         status = pod.get("status", "HEALTHY")
         cpu_pct = pod.get("cpu_pct", 5.0)
-        mem_pct = (pod.get("memory_mb", 25.0) / max(1.0, pod.get("memory_limit", 512.0))) * 100.0
 
-        if status in ["HEALTHY", "Running"] and cpu_pct < 70.0 and mem_pct < 70.0:
+        if status in ["STOPPED", "Error in image pulling", "ErrImagePull", "ImagePullBackOff"]:
             return [
                 {
                     "rank": 1,
-                    "action": "do_nothing",
-                    "reason": f"No changes required. Pod '{name}' is HEALTHY and operating normally within SLA thresholds.",
-                    "kubectl_command": f"kubectl get pod {name} -n {ns}",
-                    "impact": "low"
-                }
-            ]
-
-        if status == "STOPPED":
-            return [
-                {
-                    "rank": 1,
-                    "action": "scale_up",
-                    "reason": f"Pod '{name}' is STOPPED. Scale up deployment {dev} to start a new replica.",
-                    "kubectl_command": f"kubectl scale deployment {dev} --replicas=1 -n {ns}",
+                    "action": "force_delete",
+                    "reason": f"Pod '{name}' is in non-ready state ({status}). Force delete to replace with clean instance.",
+                    "kubectl_command": f"kubectl delete pod {name} -n {ns} --grace-period=0 --force",
                     "impact": "high"
                 },
                 {
                     "rank": 2,
                     "action": "restart",
-                    "reason": f"Perform rollout restart on deployment {dev} to spin up stopped instances.",
-                    "kubectl_command": f"kubectl rollout restart deployment/{dev} -n {ns}",
-                    "impact": "high"
-                }
-            ]
-
-        if status in ["Error in image pulling", "ErrImagePull", "ImagePullBackOff"]:
-            return [
-                {
-                    "rank": 1,
-                    "action": "delete_pod",
-                    "reason": f"Pod image pull failed ({status}). Delete pod to force image re-fetch or update container spec.",
-                    "kubectl_command": f"kubectl delete pod {name} -n {ns} --grace-period=0",
-                    "impact": "high"
-                },
-                {
-                    "rank": 2,
-                    "action": "restart",
-                    "reason": "Rollout restart deployment after verifying container image tag/registry credentials.",
+                    "reason": f"Perform rollout restart on deployment {dev}.",
                     "kubectl_command": f"kubectl rollout restart deployment/{dev} -n {ns}",
                     "impact": "medium"
                 }
@@ -230,22 +190,22 @@ class GroqSREAgent:
             return [
                 {
                     "rank": 1,
-                    "action": "kill_process",
-                    "reason": f"Active processes thrashing CPU at {cpu_pct:.1f}%. Terminating CPU stress process restores nominal load.",
-                    "kubectl_command": f"kubectl exec -it {name} -n {ns} -- pkill -f stress",
+                    "action": "scale_up",
+                    "reason": f"Scale deployment {dev} to spread high CPU load ({cpu_pct:.1f}%) across replicas.",
+                    "kubectl_command": f"kubectl scale deployment {dev} --replicas=3 -n {ns}",
                     "impact": "high"
                 },
                 {
                     "rank": 2,
-                    "action": "scale_up",
-                    "reason": f"Scale deployment {dev} to spread high CPU load across replicas.",
-                    "kubectl_command": f"kubectl scale deployment {dev} --replicas=3 -n {ns}",
-                    "impact": "medium"
+                    "action": "force_delete",
+                    "reason": f"Force delete pod '{name}' to force fresh container allocation.",
+                    "kubectl_command": f"kubectl delete pod {name} -n {ns} --grace-period=0 --force",
+                    "impact": "high"
                 },
                 {
                     "rank": 3,
                     "action": "restart",
-                    "reason": "Rollout restart deployment to clear thread locks.",
+                    "reason": "Rollout restart deployment to clear process threads.",
                     "kubectl_command": f"kubectl rollout restart deployment/{dev} -n {ns}",
                     "impact": "medium"
                 }
@@ -255,7 +215,7 @@ class GroqSREAgent:
             {
                 "rank": 1,
                 "action": "restart",
-                "reason": f"Rollout restart deployment {dev} to clear memory leak and reclaim memory buffers.",
+                "reason": f"Rollout restart deployment {dev} to recycle container memory buffers.",
                 "kubectl_command": f"kubectl rollout restart deployment/{dev} -n {ns}",
                 "impact": "high"
             },
@@ -267,5 +227,31 @@ class GroqSREAgent:
                 "impact": "medium"
             }
         ]
+
+    def rank_recommendations(self, pod: Dict, recs: List[Dict], rl_optimizer) -> List[Dict]:
+        """
+        Ranks recommendations based on the individual pod's telemetry state AND Q-table scores.
+        """
+        state_key = rl_optimizer.get_state_key(pod)
+        q_vals = rl_optimizer.get_q_values(state_key)
+        
+        enriched = []
+        for r in recs:
+            act = r.get("action", "restart")
+            q_act = "force_delete" if act in ["force_delete", "delete_pod"] else act
+            q_score = q_vals.get(q_act, 0.0)
+            
+            item = dict(r)
+            item["q_score"] = q_score
+            item["state_key"] = state_key
+            enriched.append(item)
+            
+        # Sort descending by Q-score
+        enriched.sort(key=lambda x: x["q_score"], reverse=True)
+        
+        for idx, item in enumerate(enriched):
+            item["rank"] = idx + 1
+            
+        return enriched
 
 GeminiSREAgent = GroqSREAgent
