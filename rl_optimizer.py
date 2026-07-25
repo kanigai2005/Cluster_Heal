@@ -84,35 +84,58 @@ class GroqSREAgent:
     def get_recommendations(self, pod: Dict) -> List[Dict]:
         """
         Fetches structured recommendations from Groq.
-        If API Key is missing or request fails, falls back gracefully to a robust rule-based advisor.
+        If pod is HEALTHY, returns 'no changes required'.
+        If pod is UNHEALTHY (CRITICAL, WARNING, STOPPED, ErrImagePull), passes pod state and internal process state to Groq.
         """
+        status = pod.get("status", "HEALTHY")
+        cpu_pct = pod.get("cpu_pct", 0.0)
+        mem_limit = max(1.0, pod.get("memory_limit", 512.0))
+        mem_pct = (pod.get("memory_mb", 0.0) / mem_limit) * 100.0
+        is_anomaly = pod.get("isAnomaly", False)
+
+        # Check if pod is Healthy
+        if status in ["HEALTHY", "Running"] and cpu_pct < 70.0 and mem_pct < 70.0 and not is_anomaly:
+            return [
+                {
+                    "rank": 1,
+                    "action": "do_nothing",
+                    "reason": f"No changes required. Pod '{pod['name']}' is HEALTHY and running smoothly within normal SLA limits.",
+                    "kubectl_command": f"kubectl get pod {pod['name']} -n {pod['namespace']}",
+                    "impact": "low"
+                }
+            ]
+
         process_str = "\n".join(
             f"PID {p['pid']} [{p['user']}]: CPU {p['cpu']}%, Mem {p['mem']}% -> {p['command']}"
             for p in pod.get("activeProcesses", [])
         )
-        
-        prompt = f"""
-        You are an elite Autonomous Site Reliability Engineer (SRE). Analyze the following production metric alert and container process list to generate a structured remediation prescription.
+        if not process_str:
+            process_str = "No active internal user processes detected (Pod in " + status + " state)."
 
-        [ALERT DATA]
-        Pod: {pod['name']}
+        prompt = f"""
+        You are an elite Autonomous Site Reliability Engineer (SRE). Analyze the following production pod state alert and internal process list to generate a structured remediation prescription.
+
+        [POD ALERT & STATE DATA]
+        Pod Name: {pod['name']}
         Deployment: {pod['deployment']}
         Namespace: {pod['namespace']}
-        CPU Current: {pod['cpu_pct']:.1f}% of limit ({pod['cpu_limit']} Cores)
-        Memory Current: {pod['memory_mb']:.1f} MB of limit ({pod['memory_limit']} MB)
+        Current Status / State: {status}
+        CPU Current: {cpu_pct:.1f}% of limit ({pod.get('cpu_limit', 2)} Cores)
+        Memory Current: {pod.get('memory_mb', 0):.1f} MB of limit ({mem_limit} MB)
+        Anomaly Detected: {is_anomaly}
 
-        [PROCESSES (ps aux)]
+        [INTERNAL CONTAINER PROCESSES (ps aux)]
         {process_str}
 
-        Formulate EXACTLY THREE technical recommendations to resolve this load or memory footprint.
+        Formulate 1 to 3 technical recommendations based on the pod's status and internal processes.
         Provide the response in raw JSON adhering to this schema:
-        An array of exactly three objects, each containing:
+        An array of objects, each containing:
         {{
           "rank": number (1, 2, or 3),
           "action": string (MUST be one of: "scale_up", "scale_down", "restart", "delete_pod", "kill_process", "do_nothing"),
-          "reason": string (a concise, detailed technical explanation of why this action is correct, maximum 150 characters),
-          "kubectl_command": string (the exact kubectl command the user would run, e.g. "kubectl scale deployment esp-traffic-camera --replicas=3 -n town-traffic"),
-          "impact": string (MUST be "high", "medium", or "low")
+          "reason": string (a concise, detailed technical explanation analyzing the process/state, max 150 chars),
+          "kubectl_command": string (exact kubectl command, e.g. "kubectl scale deployment {pod['deployment']} --replicas=3 -n {pod['namespace']}"),
+          "impact": string ("high", "medium", or "low")
         }}
         """
 
@@ -138,116 +161,111 @@ class GroqSREAgent:
             if response.status_code == 200:
                 data = response.json()
                 text = data['choices'][0]['message']['content']
-                return json.loads(text)
+                parsed = json.loads(text)
+                if isinstance(parsed, dict) and "recommendations" in parsed:
+                    return parsed["recommendations"]
+                if isinstance(parsed, list):
+                    return parsed
         except Exception:
             pass
 
         return self.get_fallback_recommendations(pod)
 
     def get_fallback_recommendations(self, pod: Dict) -> List[Dict]:
-        dev = pod["deployment"]
-        ns = pod["namespace"]
-        name = pod["name"]
-        
-        if "traffic-camera" in dev or "camera" in dev.lower() or "traffic" in dev.lower():
+        dev = pod.get("deployment", "service")
+        ns = pod.get("namespace", "default")
+        name = pod.get("name", "pod")
+        status = pod.get("status", "HEALTHY")
+        cpu_pct = pod.get("cpu_pct", 5.0)
+        mem_pct = (pod.get("memory_mb", 25.0) / max(1.0, pod.get("memory_limit", 512.0))) * 100.0
+
+        if status in ["HEALTHY", "Running"] and cpu_pct < 70.0 and mem_pct < 70.0:
+            return [
+                {
+                    "rank": 1,
+                    "action": "do_nothing",
+                    "reason": f"No changes required. Pod '{name}' is HEALTHY and operating normally within SLA thresholds.",
+                    "kubectl_command": f"kubectl get pod {name} -n {ns}",
+                    "impact": "low"
+                }
+            ]
+
+        if status == "STOPPED":
             return [
                 {
                     "rank": 1,
                     "action": "scale_up",
-                    "reason": "High camera feed ingestion exceeds single-instance limits. Distributing traffic resolves thread locks.",
-                    "kubectl_command": f"kubectl scale deployment {dev} --replicas=3 -n {ns}",
+                    "reason": f"Pod '{name}' is STOPPED. Scale up deployment {dev} to start a new replica.",
+                    "kubectl_command": f"kubectl scale deployment {dev} --replicas=1 -n {ns}",
                     "impact": "high"
                 },
                 {
                     "rank": 2,
                     "action": "restart",
-                    "reason": "Graceful pod rolling restart clears active video pipeline memory allocation buffers.",
+                    "reason": f"Perform rollout restart on deployment {dev} to spin up stopped instances.",
                     "kubectl_command": f"kubectl rollout restart deployment/{dev} -n {ns}",
-                    "impact": "medium"
-                },
-                {
-                    "rank": 3,
-                    "action": "do_nothing",
-                    "reason": "Let cluster autoscaler execute generic scaling protocols.",
-                    "kubectl_command": "echo 'SRE standby'",
-                    "impact": "low"
+                    "impact": "high"
                 }
             ]
-        elif "smart-kitchen" in dev or "kitchen" in dev.lower() or "smart" in dev.lower():
+
+        if status in ["Error in image pulling", "ErrImagePull", "ImagePullBackOff"]:
             return [
                 {
                     "rank": 1,
-                    "action": "restart",
-                    "reason": "JVM garbage collection is thrashing due to continuous heap leaks. Hard restart flushes state.",
-                    "kubectl_command": f"kubectl rollout restart deployment/{dev} -n {ns}",
-                    "impact": "high"
-                },
-                {
-                    "rank": 2,
                     "action": "delete_pod",
-                    "reason": "Forcefully terminating the pod triggers immediate scheduler placement on a healthier node.",
+                    "reason": f"Pod image pull failed ({status}). Delete pod to force image re-fetch or update container spec.",
                     "kubectl_command": f"kubectl delete pod {name} -n {ns} --grace-period=0",
                     "impact": "high"
                 },
                 {
-                    "rank": 3,
-                    "action": "scale_up",
-                    "reason": "Horizontal scaling acts as a buffer but won't resolve underlying code leaks long-term.",
-                    "kubectl_command": f"kubectl scale deployment {dev} --replicas=3 -n {ns}",
-                    "impact": "low"
+                    "rank": 2,
+                    "action": "restart",
+                    "reason": "Rollout restart deployment after verifying container image tag/registry credentials.",
+                    "kubectl_command": f"kubectl rollout restart deployment/{dev} -n {ns}",
+                    "impact": "medium"
                 }
             ]
-        else:
-            cpu_pct = pod.get("cpu_pct", 5.0)
-            mem_pct = (pod.get("memory_mb", 25.0) / max(1.0, pod.get("memory_limit", 512.0))) * 100.0
-            
-            if cpu_pct > 70.0:
-                return [
-                    {
-                        "rank": 1,
-                        "action": "kill_process",
-                        "reason": f"Active process threads are thrashing CPU at {cpu_pct:.1f}%. Hard-terminating stressor restores nominal state.",
-                        "kubectl_command": f"kubectl exec -it {name} -n {ns} -- pkill -f stress || kill -9 1",
-                        "impact": "high"
-                    },
-                    {
-                        "rank": 2,
-                        "action": "scale_up",
-                        "reason": f"Scale out {dev} horizontally to spread CPU bottlenecks across multiple replicas.",
-                        "kubectl_command": f"kubectl scale deployment {dev} --replicas=3 -n {ns}",
-                        "impact": "medium"
-                    },
-                    {
-                        "rank": 3,
-                        "action": "restart",
-                        "reason": "Perform rollout restart to cycle active sockets and thread locks.",
-                        "kubectl_command": f"kubectl rollout restart deployment/{dev} -n {ns}",
-                        "impact": "medium"
-                    }
-                ]
-            else:
-                return [
-                    {
-                        "rank": 1,
-                        "action": "restart",
-                        "reason": f"Rollout restart {dev} to clean active memory leaks and free system file descriptors.",
-                        "kubectl_command": f"kubectl rollout restart deployment/{dev} -n {ns}",
-                        "impact": "high"
-                    },
-                    {
-                        "rank": 2,
-                        "action": "delete_pod",
-                        "reason": f"Delete pod {name} to force Kubernetes to instantly spin up a replacement node.",
-                        "kubectl_command": f"kubectl delete pod {name} -n {ns} --grace-period=0",
-                        "impact": "high"
-                    },
-                    {
-                        "rank": 3,
-                        "action": "do_nothing",
-                        "reason": "Nominal load levels. Standby and continue telemetry stream scans.",
-                        "kubectl_command": "echo 'SRE nominal state'",
-                        "impact": "low"
-                    }
-                ]
+
+        if cpu_pct > 70.0:
+            return [
+                {
+                    "rank": 1,
+                    "action": "kill_process",
+                    "reason": f"Active processes thrashing CPU at {cpu_pct:.1f}%. Terminating CPU stress process restores nominal load.",
+                    "kubectl_command": f"kubectl exec -it {name} -n {ns} -- pkill -f stress",
+                    "impact": "high"
+                },
+                {
+                    "rank": 2,
+                    "action": "scale_up",
+                    "reason": f"Scale deployment {dev} to spread high CPU load across replicas.",
+                    "kubectl_command": f"kubectl scale deployment {dev} --replicas=3 -n {ns}",
+                    "impact": "medium"
+                },
+                {
+                    "rank": 3,
+                    "action": "restart",
+                    "reason": "Rollout restart deployment to clear thread locks.",
+                    "kubectl_command": f"kubectl rollout restart deployment/{dev} -n {ns}",
+                    "impact": "medium"
+                }
+            ]
+
+        return [
+            {
+                "rank": 1,
+                "action": "restart",
+                "reason": f"Rollout restart deployment {dev} to clear memory leak and reclaim memory buffers.",
+                "kubectl_command": f"kubectl rollout restart deployment/{dev} -n {ns}",
+                "impact": "high"
+            },
+            {
+                "rank": 2,
+                "action": "scale_down",
+                "reason": f"Scale down deployment {dev} if over-provisioned.",
+                "kubectl_command": f"kubectl scale deployment {dev} --replicas=1 -n {ns}",
+                "impact": "medium"
+            }
+        ]
 
 GeminiSREAgent = GroqSREAgent

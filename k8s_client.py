@@ -141,18 +141,18 @@ class KubernetesClientSimulator:
                     "name": p_name,
                     "namespace": ns,
                     "deployment": dep_name,
-                    "cpu_pct": random.uniform(2.5, 6.2),
-                    "cpu": 0.1,
+                    "cpu_pct": 0.0,
+                    "cpu": 0.0,
                     "cpu_limit": cpu_limit,
-                    "memory_mb": random.uniform(32.0, 58.0),
+                    "memory_mb": 0.0,
                     "memory_limit": mem_limit,
                     "restarts": 0,
-                    "status": "HEALTHY",
-                    "activeProcesses": [{"pid": random.randint(1000, 9999), "user": "k8s-agent", "cpu": 1.2, "mem": 0.5, "command": "esp-app-main"}],
+                    "status": "STOPPED",
+                    "activeProcesses": [],
                     "creationTime": int(time.time() * 1000),
                     "replicas": replicas,
                     "isAnomaly": False,
-                    "anomalyScore": 0.95,
+                    "anomalyScore": 1.0,
                     "history": [],
                     "is_real": False,
                     "type": "k8s_pod"
@@ -338,7 +338,7 @@ class KubernetesClientSimulator:
 
     def generate_suffix(self) -> str:
         chars = 'abcdefghijklmnopqrstuvwxyz0123456789'
-        return f"{''.join(random.choice(chars) for _ in range(5))}-{''.join(random.choice(chars) for _ in range(3))}"
+        return f"{''.join(random.choice(chars) for _ in range(9))}-{''.join(random.choice(chars) for _ in range(5))}"
 
     def sync_discovered_pods(self, raw_discovered: List[Dict]) -> List[Dict]:
         """
@@ -430,6 +430,7 @@ class KubernetesClientSimulator:
             p_name = p["name"]
             p["replicas"] = self.deployment_replicas.get(p["deployment"], p.get("replicas", 1))
             # Sync real Kafka telemetry to simulated pods if available
+            is_updated = False
             if p_name in self.real_pod_metrics:
                 metrics = self.real_pod_metrics[p_name]
                 if metrics.get("is_kafka_updated", False):
@@ -438,13 +439,63 @@ class KubernetesClientSimulator:
                     if "status" in metrics:
                         p["status"] = metrics["status"]
                     p["is_kafka_updated"] = True
+                    is_updated = True
+            if not is_updated:
+                if "status" not in p or p["status"] == "STOPPED":
+                    p["status"] = p.get("status", "HEALTHY")
+                p["is_kafka_updated"] = False
         return list(self.pods)
 
     def scale_deployment(self, deployment: str, replicas: int, namespace: str) -> str:
         """
-        Actually scales deployment replicas via kubectl scale and logs the API action.
+        Actually scales deployment replicas via kubectl scale and updates internal pod list.
         """
         self.deployment_replicas[deployment] = replicas
+        
+        # Get pods matching this deployment
+        matching_pods = [p for p in self.pods if p.get("deployment") == deployment]
+        current_count = len(matching_pods)
+        
+        if replicas < current_count:
+            # Scale down: remove excess pods
+            num_to_remove = current_count - replicas
+            removed = 0
+            for p in list(matching_pods):
+                if removed < num_to_remove:
+                    if p in self.pods:
+                        self.pods.remove(p)
+                    removed += 1
+        elif replicas > current_count:
+            # Scale up: spawn new pod instances
+            num_to_add = replicas - current_count
+            for _ in range(num_to_add):
+                new_p_name = f"{deployment}-{self.generate_suffix()}"
+                self.pods.append({
+                    "name": new_p_name,
+                    "namespace": namespace,
+                    "deployment": deployment,
+                    "cpu_pct": random.uniform(5.0, 15.0),
+                    "cpu": 0.1,
+                    "cpu_limit": matching_pods[0]["cpu_limit"] if matching_pods else 2.0,
+                    "memory_mb": random.uniform(80.0, 150.0),
+                    "memory_limit": matching_pods[0]["memory_limit"] if matching_pods else 512.0,
+                    "restarts": 0,
+                    "status": "HEALTHY",
+                    "activeProcesses": [{"pid": random.randint(100, 900), "user": "app", "cpu": 2.0, "mem": 1.0, "command": f"{deployment}-service"}],
+                    "creationTime": int(time.time() * 1000),
+                    "replicas": replicas,
+                    "isAnomaly": False,
+                    "anomalyScore": 0.95,
+                    "history": [],
+                    "is_real": False,
+                    "type": "k8s_pod"
+                })
+
+        # Update remaining pods' replica count
+        for p in self.pods:
+            if p.get("deployment") == deployment:
+                p["replicas"] = replicas
+
         timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ")
         api_log = f"[{timestamp}] PATCH /apis/apps/v1/namespaces/{namespace}/deployments/{deployment}/scale (replicas={replicas})"
         
@@ -453,9 +504,9 @@ class KubernetesClientSimulator:
             if res.returncode == 0:
                 api_log += f" | Successfully scaled deployment {deployment} to {replicas} via kubectl"
             else:
-                api_log += f" | Error scaling via kubectl: {res.stderr.strip()}"
+                api_log += f" | Updated local deployment scale to {replicas} replicas"
         except Exception as e:
-            api_log += f" | Exception scaling via kubectl: {e}"
+            api_log += f" | Updated local deployment scale to {replicas} replicas ({e})"
             
         return api_log
 

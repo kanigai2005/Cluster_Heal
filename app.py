@@ -287,12 +287,13 @@ def run_fluctuation_step():
             mem_pct = (pod["memory_mb"] / max(1.0, pod["memory_limit"])) * 100.0
             
             # Recalculate status based on real metrics and SRE thresholds
-            if pod["cpu_pct"] >= config.CPU_CRITICAL_THRESHOLD_PCT or mem_pct >= config.MEM_CRITICAL_THRESHOLD_PCT:
-                pod["status"] = "CRITICAL"
-            elif pod["cpu_pct"] >= config.CPU_WARNING_THRESHOLD_PCT or mem_pct >= config.MEM_WARNING_THRESHOLD_PCT:
-                pod["status"] = "WARNING"
-            else:
-                pod["status"] = "HEALTHY"
+            if pod["status"] not in ["STOPPED", "Error in image pulling", "ErrImagePull", "ImagePullBackOff"]:
+                if pod["cpu_pct"] >= config.CPU_CRITICAL_THRESHOLD_PCT or mem_pct >= config.MEM_CRITICAL_THRESHOLD_PCT:
+                    pod["status"] = "CRITICAL"
+                elif pod["cpu_pct"] >= config.CPU_WARNING_THRESHOLD_PCT or mem_pct >= config.MEM_WARNING_THRESHOLD_PCT:
+                    pod["status"] = "WARNING"
+                else:
+                    pod["status"] = "HEALTHY"
                 
             is_anomaly, score = st.session_state.anomaly_detector.analyze_metrics(pod["cpu_pct"], mem_pct)
             pod["isAnomaly"] = is_anomaly
@@ -303,6 +304,42 @@ def run_fluctuation_step():
             pod["history"].append({
                 "cpu_pct": round(pod["cpu_pct"], 1),
                 "memory_mb": round(pod["memory_mb"], 1),
+                "timestamp": int(time.time() * 1000)
+            })
+            if len(pod["history"]) > 25:
+                pod["history"].pop(0)
+            continue
+        elif pod.get("status") == "STOPPED":
+            pod["cpu_pct"] = 0.0
+            pod["cpu"] = 0.0
+            pod["memory_mb"] = 0.0
+            pod["activeProcesses"] = []
+            pod["isAnomaly"] = False
+            pod["anomalyScore"] = 1.0
+            
+            if "history" not in pod:
+                pod["history"] = []
+            pod["history"].append({
+                "cpu_pct": 0.0,
+                "memory_mb": 0.0,
+                "timestamp": int(time.time() * 1000)
+            })
+            if len(pod["history"]) > 25:
+                pod["history"].pop(0)
+            continue
+        elif pod.get("status") in ["Error in image pulling", "ErrImagePull", "ImagePullBackOff"]:
+            pod["cpu_pct"] = 0.0
+            pod["cpu"] = 0.0
+            pod["memory_mb"] = 0.0
+            pod["activeProcesses"] = [{"pid": 0, "user": "kubelet", "cpu": 0.0, "mem": 0.0, "command": "ErrImagePull: rpc error: image pull failed"}]
+            pod["isAnomaly"] = True
+            pod["anomalyScore"] = -0.8
+            
+            if "history" not in pod:
+                pod["history"] = []
+            pod["history"].append({
+                "cpu_pct": 0.0,
+                "memory_mb": 0.0,
                 "timestamp": int(time.time() * 1000)
             })
             if len(pod["history"]) > 25:
@@ -403,7 +440,32 @@ def run_fluctuation_step():
             # Map Prometheus metric value back to matching discovered pod if possible
             matched_pod = None
             if pod_name and pod_name not in ["unknown-pod", "generic-stream"]:
+                # 1. Exact match by pod name
                 matched_pod = next((p for p in st.session_state.pods if p["name"] == pod_name), None)
+                
+                # 2. Extract deployment name to look for matching simulated pod to upgrade
+                dep_parts = pod_name.split("-")
+                deployment_name = "-".join(dep_parts[:-2]) if (len(dep_parts) >= 3 and len(dep_parts[-1]) == 5 and dep_parts[-1].isalnum()) else pod_name
+                
+                if not matched_pod:
+                    # Find a simulated pod for the same deployment to dynamically upgrade and rename
+                    matched_pod = next((p for p in st.session_state.pods if p["deployment"] == deployment_name and not p.get("is_real", False)), None)
+                    if matched_pod:
+                        old_name = matched_pod["name"]
+                        matched_pod["name"] = pod_name
+                        matched_pod["is_real"] = True
+                        matched_pod["is_kafka_updated"] = True
+                        
+                        # Sync rename in stateful k8s_client
+                        if 'k8s_client' in st.session_state:
+                            k8s_pod = next((p for p in st.session_state.k8s_client.pods if p["name"] == old_name), None)
+                            if k8s_pod:
+                                k8s_pod["name"] = pod_name
+                                k8s_pod["is_real"] = True
+                                k8s_pod["is_kafka_updated"] = True
+                            if old_name in st.session_state.k8s_client.real_pod_metrics:
+                                st.session_state.k8s_client.real_pod_metrics[pod_name] = st.session_state.k8s_client.real_pod_metrics.pop(old_name)
+                
                 if not matched_pod:
                     matched_pod = next((p for p in st.session_state.pods if pod_name.startswith(p["name"]) or p["name"].startswith(pod_name)), None)
                 if not matched_pod:
@@ -479,6 +541,27 @@ def run_fluctuation_step():
             
             # Update matching pods from live SRE stream
             matched_pod = next((p for p in st.session_state.pods if p["name"] == pod_name), None)
+            
+            # Check for simulated pod representing same deployment to upgrade/rename
+            if not matched_pod and pod_name and pod_name not in ["unknown-pod", "generic-stream"]:
+                dep_parts = pod_name.split("-")
+                deployment_name = "-".join(dep_parts[:-2]) if (len(dep_parts) >= 3 and len(dep_parts[-1]) == 5 and dep_parts[-1].isalnum()) else pod_name
+                matched_pod = next((p for p in st.session_state.pods if p["deployment"] == deployment_name and not p.get("is_real", False)), None)
+                if matched_pod:
+                    old_name = matched_pod["name"]
+                    matched_pod["name"] = pod_name
+                    matched_pod["is_real"] = True
+                    matched_pod["is_kafka_updated"] = True
+                    
+                    if 'k8s_client' in st.session_state:
+                        k8s_pod = next((p for p in st.session_state.k8s_client.pods if p["name"] == old_name), None)
+                        if k8s_pod:
+                            k8s_pod["name"] = pod_name
+                            k8s_pod["is_real"] = True
+                            k8s_pod["is_kafka_updated"] = True
+                        if old_name in st.session_state.k8s_client.real_pod_metrics:
+                            st.session_state.k8s_client.real_pod_metrics[pod_name] = st.session_state.k8s_client.real_pod_metrics.pop(old_name)
+
             if matched_pod:
                 if cpu_val is not None:
                     matched_pod["cpu_pct"] = cpu_val
@@ -779,7 +862,7 @@ if not st.session_state.get('logged_in', False):
             st.markdown("<h4 style='text-align: center; color: #58a6ff; font-family: monospace; margin-bottom: 15px;'>🛡️ CREDENTIALS CHECKPOINT</h4>", unsafe_allow_html=True)
             username = st.text_input("Username / SRE Operator ID", value="admin", help="Default credentials: admin")
             password = st.text_input("Access Control Password", type="password", value="sre-password", help="Default credentials: sre-password")
-            submitted = st.form_submit_button("🔑 DECRYPT & INITIALIZE CONSOLE", use_container_width=True)
+            submitted = st.form_submit_button("🔑 DECRYPT & INITIALIZE CONSOLE", width='stretch')
             
             if submitted:
                 if username == "admin" and password == "sre-password":
@@ -928,33 +1011,56 @@ tab_telemetry, tab_remediation, tab_rl = st.tabs([
 with tab_telemetry:
     st.markdown("### Kubernetes Discovered Pods Node Grid")
     
+    # Informational notice about kubectl top / Metrics API
+    st.markdown("""
+        <div style="background-color: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 10px 16px; margin-bottom: 16px; font-size: 13px; color: #8b949e; display: flex; align-items: center; justify-content: space-between;">
+            <div>
+                <span style="color: #00e5ff; font-weight: bold; font-family: monospace;">ℹ️ METRICS API COMPATIBILITY:</span>
+                If <code>kubectl top pod</code> returns <i>"error: Metrics API not available"</i> on your local cluster, this platform seamlessly scrapes container cAdvisor and kernel process metrics directly.
+            </div>
+            <span style="background-color: #21262d; border: 1px solid #30363d; color: #39ff14; padding: 2px 8px; border-radius: 4px; font-family: monospace; font-size: 11px;">AUTO SCRAPE ACTIVE</span>
+        </div>
+    """, unsafe_allow_html=True)
+    
     # 2x2 grid for discovered pods
     p_cols = st.columns(4)
     for idx, pod in enumerate(st.session_state.pods):
         with p_cols[idx % 4]:
             card_style = "pod-card"
-            if pod["status"] == "CRITICAL":
+            if pod["status"] in ["CRITICAL", "Error in image pulling", "ErrImagePull", "ImagePullBackOff"]:
                 card_style = "pod-card-critical"
-            elif pod["status"] == "WARNING":
+            elif pod["status"] in ["WARNING", "STOPPED"]:
                 card_style = "pod-card-warning"
                 
-            status_color = "#39ff14" if pod["status"] == "HEALTHY" else "#d29922" if pod["status"] == "WARNING" else "#f85149"
+            status_color = "#39ff14" if pod["status"] == "HEALTHY" else "#d29922" if pod["status"] in ["WARNING", "STOPPED"] else "#f85149"
             anomaly_lbl = f"<span style='color: #f85149; font-weight:bold;'>Anomaly ({pod['anomalyScore']})</span>" if pod["isAnomaly"] else f"<span style='color: #39ff14;'>Nominal ({pod['anomalyScore']})</span>"
             
+            # Format creation age
+            created_ts = pod.get("creationTime", int(time.time() * 1000))
+            age_sec = max(0, int(time.time() - (created_ts / 1000.0)))
+            if age_sec < 60:
+                age_str = f"{age_sec}s"
+            elif age_sec < 3600:
+                age_str = f"{age_sec // 60}m"
+            else:
+                age_str = f"{age_sec // 3600}h"
+
+            full_status = pod["status"]
+
             st.markdown(clean_html(f"""
                 <div class="{card_style}">
                     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
-                        <span style="font-size: 13px; background-color: #21262d; border: 1px solid #30363d; padding: 4px 10px; border-radius: 6px; font-family: monospace; color: #8b949e;">{pod['namespace']}</span>
-                        <strong style="color: {status_color}; font-size: 13px; text-transform: uppercase; border: 1px solid {status_color}50; padding: 3px 10px; border-radius: 12px; background-color: {status_color}10;">{pod['status']}</strong>
+                        <span style="font-size: 12px; background-color: #21262d; border: 1px solid #30363d; padding: 4px 10px; border-radius: 6px; font-family: monospace; color: #8b949e;">{pod['namespace']}</span>
+                        <strong style="color: {status_color}; font-size: 12px; text-transform: uppercase; border: 1px solid {status_color}50; padding: 3px 8px; border-radius: 12px; background-color: {status_color}10; white-space: nowrap; max-width: 150px; overflow: hidden; text-overflow: ellipsis;" title="{full_status}">{full_status}</strong>
                     </div>
                     <div style="margin-bottom: 16px; height: 65px; overflow: hidden;">
-                        <h4 style="margin: 0; font-size: 17px; color: #f0f6fc; text-overflow: ellipsis; white-space: nowrap;" title="{pod['name']}">{pod['name']}</h4>
-                        <span style="font-size: 13px; color: #8b949e;">Deployment: <strong>{pod['deployment']}</strong></span>
+                        <h4 style="margin: 0; font-size: 16px; color: #f0f6fc; text-overflow: ellipsis; white-space: nowrap;" title="{pod['name']}">{pod['name']}</h4>
+                        <span style="font-size: 12px; color: #8b949e;">Deployment: <strong style="color: #c9d1d9;">{pod['deployment']}</strong></span>
                     </div>
                     
                     <!-- CPU Metric Gauge -->
                     <div style="margin-bottom: 14px;">
-                        <div style="display: flex; justify-content: space-between; font-size: 13px; font-family: monospace; margin-bottom: 4px;">
+                        <div style="display: flex; justify-content: space-between; font-size: 12px; font-family: monospace; margin-bottom: 4px;">
                             <span style="color: #8b949e;">CPU utilization:</span>
                             <strong style="color: {status_color};">{pod['cpu_pct']:.1f}%</strong>
                         </div>
@@ -969,7 +1075,7 @@ with tab_telemetry:
 
                     <!-- Memory Metric Gauge -->
                     <div style="margin-bottom: 16px;">
-                        <div style="display: flex; justify-content: space-between; font-size: 13px; font-family: monospace; margin-bottom: 4px;">
+                        <div style="display: flex; justify-content: space-between; font-size: 12px; font-family: monospace; margin-bottom: 4px;">
                             <span style="color: #8b949e;">Memory allocation:</span>
                             <strong style="color: #58a6ff;">{int((pod['memory_mb'] / max(1.0, pod['memory_limit'])) * 100.0)}%</strong>
                         </div>
@@ -983,28 +1089,46 @@ with tab_telemetry:
                     </div>
 
                     <!-- Extra Stats -->
-                    <div style="display: flex; gap: 8px; margin-bottom: 14px; background-color: #0d1117; padding: 8px; border-radius: 8px; border: 1px solid #21262d; justify-content: space-between; text-align: center;">
+                    <div style="display: flex; gap: 6px; margin-bottom: 14px; background-color: #0d1117; padding: 8px; border-radius: 8px; border: 1px solid #21262d; justify-content: space-between; text-align: center;">
                         <div style="flex:1;">
-                            <span style="font-size: 11px; color: #8b949e; display:block; font-family: monospace; font-weight: bold;">REPLICAS</span>
-                            <strong style="font-size: 14px; color: #c9d1d9; font-family: monospace;">{pod['replicas']}/3</strong>
+                            <span style="font-size: 10px; color: #8b949e; display:block; font-family: monospace; font-weight: bold;">REPLICAS</span>
+                            <strong style="font-size: 13px; color: #c9d1d9; font-family: monospace;">{pod['replicas']}/3</strong>
                         </div>
                         <div style="flex:1; border-left: 1px solid #21262d; border-right: 1px solid #21262d;">
-                            <span style="font-size: 11px; color: #8b949e; display:block; font-family: monospace; font-weight: bold;">RESTARTS</span>
-                            <strong style="font-size: 14px; color: #c9d1d9; font-family: monospace;">{pod['restarts']}</strong>
+                            <span style="font-size: 10px; color: #8b949e; display:block; font-family: monospace; font-weight: bold;">RESTARTS</span>
+                            <strong style="font-size: 13px; color: #c9d1d9; font-family: monospace;">{pod['restarts']}</strong>
                         </div>
                         <div style="flex:1;">
-                            <span style="font-size: 11px; color: #8b949e; display:block; font-family: monospace; font-weight: bold;">STATUS</span>
-                            <strong style="font-size: 14px; color: #c9d1d9; font-family: monospace;">{pod['status'][:4]}</strong>
+                            <span style="font-size: 10px; color: #8b949e; display:block; font-family: monospace; font-weight: bold;">STATE</span>
+                            <strong style="font-size: 12px; color: {status_color}; font-family: monospace; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: block;" title="{full_status}">{full_status}</strong>
                         </div>
                     </div>
 
-                    <!-- Isolation score -->
-                    <div style="display: flex; justify-content: space-between; align-items: center; font-size: 12px; font-family: monospace; border-top: 1px solid #21262d; padding-top: 8px;">
-                        <span style="color: #8b949e;">Isolation Forest:</span>
-                        <strong>{anomaly_lbl}</strong>
+                    <!-- Isolation score & Age -->
+                    <div style="display: flex; justify-content: space-between; align-items: center; font-size: 11px; font-family: monospace; border-top: 1px solid #21262d; padding-top: 8px;">
+                        <span style="color: #8b949e;">Isolation: {anomaly_lbl}</span>
+                        <span style="color: #8b949e;">Age: {age_str}</span>
                     </div>
                 </div>
             """), unsafe_allow_html=True)
+            
+            # Details Expander right on card
+            with st.expander(f"📋 Pod Specs & Processes ({pod['name'][:18]}...)", expanded=False):
+                st.markdown(f"""
+                - **Pod Name:** `{pod['name']}`
+                - **Namespace:** `{pod['namespace']}`
+                - **Deployment:** `{pod['deployment']}`
+                - **Status:** `{full_status}`
+                - **CPU Limit:** `{pod['cpu_limit']} Cores` | **Mem Limit:** `{pod['memory_limit']} MB`
+                - **Type:** `{pod.get('type', 'k8s_pod')}`
+                """)
+                procs = pod.get("activeProcesses", [])
+                if procs:
+                    st.markdown("**Active Container Processes (ps aux):**")
+                    for pr in procs:
+                        st.markdown(f"- PID `{pr.get('pid')}` (`{pr.get('user')}`): CPU `{pr.get('cpu')}%` | Mem `{pr.get('mem')}%` → `{pr.get('command')}`")
+                else:
+                    st.caption("No active user processes inside container.")
             
             # Button layouts
             b_col1, b_col2 = st.columns(2)
@@ -1067,7 +1191,7 @@ with tab_telemetry:
                 yaxis=dict(title=dict(text='CPU %', font=dict(color='#39ff14')), gridcolor='#21262d', zerolinecolor='#21262d'),
                 yaxis2=dict(title=dict(text='Memory MB', font=dict(color='#58a6ff')), overlaying='y', side='right', gridcolor='#21262d', showgrid=False)
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
 
     with vis_col2:
         st.markdown("### 🧬 active Container Process Monitor (ps aux)")
@@ -1077,7 +1201,7 @@ with tab_telemetry:
             p_df = pd.DataFrame(processes)
             if not p_df.empty:
                 p_df.columns = ["PID", "User", "CPU %", "Mem %", "Command"]
-                st.dataframe(p_df, hide_index=True, use_container_width=True, height=220)
+                st.dataframe(p_df, hide_index=True, width='stretch', height=220)
             else:
                 st.info("No active processes detected in this container core.")
                 
@@ -1123,33 +1247,6 @@ with tab_remediation:
     rem_col1, rem_col2 = st.columns([1.2, 1])
     
     with rem_col1:
-        st.markdown("### 🚨 Active Cluster Alerts & Incidents")
-        alert_pods = [p for p in st.session_state.pods if p["status"] != "HEALTHY"]
-        
-        if alert_pods:
-            for p in alert_pods:
-                color_theme = "red" if p["status"] == "CRITICAL" else "orange"
-                bg_col = "#2d161a" if p["status"] == "CRITICAL" else "#251c10"
-                border_col = "#f85149" if p["status"] == "CRITICAL" else "#d29922"
-                
-                st.markdown(clean_html(f"""
-                    <div style="background-color: {bg_col}; border: 1px solid {border_col}; padding: 18px; border-radius: 10px; margin-bottom: 16px; display: flex; justify-content: space-between; align-items: center;">
-                        <div>
-                            <span style="font-size: 14px; background-color: rgba(255,255,255,0.07); padding: 4px 8px; border-radius: 6px; font-family: monospace;">{p['namespace']}</span>
-                            <strong style="margin-left: 8px; font-size: 16px; color: #fff; font-family: monospace;">{p['name']}</strong>
-                            <div style="margin-top: 8px; font-size: 14px; color: #ffbc5b;">
-                                WARNING: {p['deployment']} metrics out of normal bounds. CPU: {p['cpu_pct']:.1f}% | Memory: {p['memory_mb']:.1f} MB
-                            </div>
-                        </div>
-                        <div style="font-size: 14px; text-transform: uppercase; font-family: monospace; font-weight: bold; border: 1px solid {border_col}; padding: 4px 10px; border-radius: 6px; background-color: rgba(0,0,0,0.25);">
-                            {p['status']}
-                        </div>
-                    </div>
-                """), unsafe_allow_html=True)
-        else:
-            st.success("🎉 Excellent! All container pods discovered are currently HEALTHY and operating nominal.")
-            
-        st.markdown("---")
         st.markdown("### 🛠️ Interactive Remediation Execution Matrix")
         
         target_remedy_pod_name = st.selectbox(
@@ -1165,25 +1262,76 @@ with tab_remediation:
             # Action button matrix grid
             act_cols = st.columns(3)
             with act_cols[0]:
-                if st.button("⚡ Horizontal Scale (Up 3x)", use_container_width=True, help="Scale deployment up to 3 replicas"):
+                if st.button("⚡ Horizontal Scale (Up 3x)", width='stretch', help="Scale deployment up to 3 replicas"):
                     execute_remediation(target_remedy_pod_name, "scale_up")
                     st.rerun()
-                if st.button("🔌 rollout restart", use_container_width=True, help="Re-roll active pod instances"):
+                if st.button("🔌 rollout restart", width='stretch', help="Re-roll active pod instances"):
                     execute_remediation(target_remedy_pod_name, "restart")
                     st.rerun()
             with act_cols[1]:
-                if st.button("📉 Horizontal Scale (Down 1x)", use_container_width=True, help="Scale back down to 1 instance"):
+                if st.button("📉 Horizontal Scale (Down 1x)", width='stretch', help="Scale back down to 1 instance"):
                     execute_remediation(target_remedy_pod_name, "scale_down")
                     st.rerun()
-                if st.button("🗑️ Force Delete Pod", use_container_width=True, help="Immediately delete pod instance"):
+                if st.button("🗑️ Force Delete Pod", width='stretch', help="Immediately delete pod instance"):
                     execute_remediation(target_remedy_pod_name, "delete_pod")
                     st.rerun()
             with act_cols[2]:
-                if st.button("☠️ Kill stress/java", use_container_width=True, help="Force kill specific stress/java execution binaries"):
+                if st.button("☠️ Kill stress/java", width='stretch', help="Force kill specific stress/java execution binaries"):
                     execute_remediation(target_remedy_pod_name, "kill_process")
                     st.rerun()
-                if st.button("🤷 Standing By (Do Nothing)", use_container_width=True, help="Acknowledge alert but stand by"):
+                if st.button("🤷 Standing By (Do Nothing)", width='stretch', help="Acknowledge alert but stand by"):
                     execute_remediation(target_remedy_pod_name, "do_nothing")
+                    st.rerun()
+
+            st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
+            st.markdown("#### 🧪 Direct Pod State Simulator Controls")
+            state_cols = st.columns(4)
+            with state_cols[0]:
+                if st.button("🟢 State: Running", width='stretch', help="Set pod state to Running (Healthy)"):
+                    target_remedy_pod["status"] = "HEALTHY"
+                    target_remedy_pod["cpu_pct"] = 12.0
+                    target_remedy_pod["memory_mb"] = 35.0
+                    target_remedy_pod["isAnomaly"] = False
+                    target_remedy_pod["activeProcesses"] = [{"pid": random.randint(100, 999), "user": "app", "cpu": 1.2, "mem": 2.5, "command": "app-server"}]
+                    if 'k8s_client' in st.session_state:
+                        k8s_p = next((p for p in st.session_state.k8s_client.pods if p["name"] == target_remedy_pod_name), None)
+                        if k8s_p:
+                            k8s_p["status"] = "HEALTHY"
+                            k8s_p["cpu_pct"] = 12.0
+                            k8s_p["memory_mb"] = 35.0
+                    st.toast(f"Set state of {target_remedy_pod_name} to RUNNING", icon="🟢")
+                    st.rerun()
+            with state_cols[1]:
+                if st.button("🔴 State: Stopped", width='stretch', help="Set pod state to Stopped"):
+                    target_remedy_pod["status"] = "STOPPED"
+                    target_remedy_pod["cpu_pct"] = 0.0
+                    target_remedy_pod["memory_mb"] = 0.0
+                    target_remedy_pod["activeProcesses"] = []
+                    if 'k8s_client' in st.session_state:
+                        k8s_p = next((p for p in st.session_state.k8s_client.pods if p["name"] == target_remedy_pod_name), None)
+                        if k8s_p:
+                            k8s_p["status"] = "STOPPED"
+                            k8s_p["cpu_pct"] = 0.0
+                            k8s_p["memory_mb"] = 0.0
+                    st.toast(f"Set state of {target_remedy_pod_name} to STOPPED", icon="🔴")
+                    st.rerun()
+            with state_cols[2]:
+                if st.button("⚠️ State: Image Pull Error", width='stretch', help="Set pod state to Error in image pulling"):
+                    target_remedy_pod["status"] = "Error in image pulling"
+                    target_remedy_pod["cpu_pct"] = 0.0
+                    target_remedy_pod["memory_mb"] = 0.0
+                    target_remedy_pod["activeProcesses"] = [{"pid": 0, "user": "kubelet", "cpu": 0.0, "mem": 0.0, "command": "ErrImagePull: rpc error: image pull failed"}]
+                    if 'k8s_client' in st.session_state:
+                        k8s_p = next((p for p in st.session_state.k8s_client.pods if p["name"] == target_remedy_pod_name), None)
+                        if k8s_p:
+                            k8s_p["status"] = "Error in image pulling"
+                            k8s_p["cpu_pct"] = 0.0
+                            k8s_p["memory_mb"] = 0.0
+                    st.toast(f"Set state of {target_remedy_pod_name} to ERR_IMAGE_PULL", icon="⚠️")
+                    st.rerun()
+            with state_cols[3]:
+                if st.button("🔥 Inject Process Load", width='stretch', help="Inject heavy CPU/Memory process load"):
+                    inject_chaos_load(target_remedy_pod_name)
                     st.rerun()
 
     with rem_col2:
@@ -1263,7 +1411,7 @@ with tab_rl:
             
         if q_table_data:
             q_df = pd.DataFrame(q_table_data)
-            st.dataframe(q_df, hide_index=True, use_container_width=True, height=220)
+            st.dataframe(q_df, hide_index=True, width='stretch', height=220)
         else:
             # Seed state visual table
             sample_states = [
@@ -1272,7 +1420,7 @@ with tab_rl:
                 {"SRE Telemetry State": "water_high_cpu_ok_mem", "scale_up": -4.0, "scale_down": -5.0, "restart": 4.0, "delete_pod": 4.0, "kill_process": 12.0, "do_nothing": -5.0}
             ]
             q_df = pd.DataFrame(sample_states)
-            st.dataframe(q_df, hide_index=True, use_container_width=True, height=180)
+            st.dataframe(q_df, hide_index=True, width='stretch', height=180)
             st.info("Optimizer has not learned custom states in this session yet. System is using baseline SRE heuristics.")
             
         st.markdown("---")

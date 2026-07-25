@@ -1,6 +1,7 @@
 import time
 import json
 import random
+import socket
 from typing import Dict, List
 
 # Try to import real KafkaProducer
@@ -17,7 +18,20 @@ class TelemetryProducerSimulator:
         self.connected = False
         self.producer = None
         
-        if KAFKA_AVAILABLE:
+        # Verify socket connection first to ensure Kafka is actually reachable and listening
+        is_reachable = False
+        try:
+            for server in self.servers.split(","):
+                parts = server.strip().split(":")
+                if len(parts) == 2:
+                    host, port = parts[0], int(parts[1])
+                    with socket.create_connection((host, port), timeout=0.5) as s:
+                        is_reachable = True
+                        break
+        except Exception:
+            pass
+        
+        if KAFKA_AVAILABLE and is_reachable:
             try:
                 # Use a fast 1-second timeout to prevent blocking Streamlit if local broker is down
                 self.producer = KafkaProducer(
@@ -31,6 +45,12 @@ class TelemetryProducerSimulator:
                 print(f"✅ Real Kafka Producer successfully initialized on {self.servers}")
             except Exception as e:
                 print(f"⚠️ Real Kafka Producer failed to initialize ({e}). Operating in simulation mode.")
+        else:
+            if not is_reachable:
+                print(f"⚠️ Kafka Broker on {self.servers} is unreachable (Socket check failed). Operating in simulation mode.")
+            else:
+                print("⚠️ Kafka library not available. Operating in simulation mode.")
+
 
     def serialize_telemetry(self, pod: Dict) -> str:
         payload = {

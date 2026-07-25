@@ -1,6 +1,7 @@
 import time
 import json
 import random
+import socket
 from typing import List, Dict
 
 # Try to import real KafkaConsumer
@@ -16,7 +17,20 @@ class TelemetryConsumerSimulator:
         self.connected = False
         self.consumer = None
         
-        if KAFKA_AVAILABLE:
+        # Verify socket connection first to ensure Kafka is actually reachable and listening
+        is_reachable = False
+        try:
+            for server in self.servers.split(","):
+                parts = server.strip().split(":")
+                if len(parts) == 2:
+                    host, port = parts[0], int(parts[1])
+                    with socket.create_connection((host, port), timeout=0.5) as s:
+                        is_reachable = True
+                        break
+        except Exception:
+            pass
+        
+        if KAFKA_AVAILABLE and is_reachable:
             try:
                 # Initialize real Kafka consumer with a fast timeout
                 # It listens from the latest messages to ensure live processing
@@ -32,6 +46,11 @@ class TelemetryConsumerSimulator:
                 print(f"✅ Real Kafka Consumer successfully initialized on {self.servers}")
             except Exception as e:
                 print(f"⚠️ Real Kafka Consumer failed to initialize ({e}). Operating in simulation mode.")
+        else:
+            if not is_reachable:
+                print(f"⚠️ Kafka Broker on {self.servers} is unreachable (Socket check failed). Operating in simulation mode.")
+            else:
+                print("⚠️ Kafka library not available. Operating in simulation mode.")
 
     def poll_messages(self, topic: str = "sre-pod-telemetry", limit: int = 15) -> List[Dict]:
         """
@@ -65,17 +84,25 @@ class TelemetryConsumerSimulator:
                         }
                         
                         # Case 1: Prometheus Kafka Adapter JSON Output schema
-                        # Format: {"timestamp": ..., "value": ..., "metric": ..., "labels": {...}}
-                        if isinstance(payload, dict) and "metric" in payload and "labels" in payload:
+                        # Format 1: {"timestamp": ..., "value": ..., "metric": ..., "labels": {...}}
+                        # Format 2 (Standard Kafka exporter): {"timestamp": ..., "value": ..., "name": ..., "labels": {...}}
+                        if isinstance(payload, dict) and ("metric" in payload or "name" in payload) and "labels" in payload:
                             normalized["type"] = "prometheus_adapter_metric"
-                            normalized["metric_name"] = payload.get("metric", "")
-                            normalized["metric_value"] = payload.get("value", 0.0)
+                            normalized["metric_name"] = payload.get("metric") or payload.get("name", "")
+                            
+                            # Parse value safely (could be float, int, or numeric string)
+                            raw_val = payload.get("value", 0.0)
+                            try:
+                                normalized["metric_value"] = float(raw_val)
+                            except (ValueError, TypeError):
+                                normalized["metric_value"] = 0.0
+                                
                             normalized["labels"] = payload.get("labels", {})
                             
                             # Safely extract pod identity and namespace from Labels
                             labels = payload.get("labels", {})
-                            normalized["pod_name"] = labels.get("pod", labels.get("container", "unknown-pod"))
-                            normalized["namespace"] = labels.get("namespace", "default")
+                            normalized["pod_name"] = labels.get("pod", labels.get("container", labels.get("kubernetes_pod_name", "unknown-pod")))
+                            normalized["namespace"] = labels.get("namespace", labels.get("kubernetes_namespace", "default"))
                         
                         # Case 2: Custom SRE platform telemetry
                         # Format: {"name": ..., "namespace": ..., "cpu_pct": ..., "memory_mb": ...}
@@ -96,65 +123,5 @@ class TelemetryConsumerSimulator:
             except Exception as e:
                 print(f"⚠️ Error polling real-time Kafka metrics: {e}")
                 
-        # If no real messages were polled (not connected or silent topic),
-        # automatically generate simulated real-time telemetry events to keep charts alive
-        if not polled_data:
-            import streamlit as st
-            active_pods = st.session_state.get('pods', [])
-            print("==================================DUMMY POLLED DATA================================\n")
-            timestamp_ms = int(time.time() * 1000)
-            timestamp_str = time.strftime("%H:%M:%S")
-            
-            # Generate highly detailed telemetry signals matching our actual active Kubernetes pods
-            if active_pods:
-                for pod in random.sample(active_pods, min(len(active_pods), random.randint(1, 3))):
-                    normalized_msg = {
-                        "source": "SIMULATION",
-                        "topic": topic,
-                        "partition": 0,
-                        "offset": random.randint(10000, 50000),
-                        "timestamp": timestamp_ms,
-                        "timestamp_str": timestamp_str,
-                        "type": "sre_platform_telemetry",
-                        "pod_name": pod["name"],
-                        "namespace": pod["namespace"],
-                        "cpu_pct": pod["cpu_pct"],
-                        "memory_mb": pod["memory_mb"],
-                        "status": pod["status"],
-                        "raw_payload": {
-                            "metric": "container_cpu_usage_seconds_total",
-                            "value": round(pod["cpu"], 2),
-                            "labels": {
-                                "pod": pod["name"],
-                                "namespace": pod["namespace"]
-                            }
-                        }
-                    }
-                    polled_data.append(normalized_msg)
-            else:
-                for _ in range(random.randint(1, 3)):
-                    normalized_msg = {
-                        "source": "SIMULATION",
-                        "topic": topic,
-                        "partition": 0,
-                        "offset": random.randint(10000, 50000),
-                        "timestamp": timestamp_ms,
-                        "timestamp_str": timestamp_str,
-                        "type": "sre_platform_telemetry",
-                        "pod_name": "esp-traffic-camera-abcde-fgh",
-                        "namespace": "town-traffic",
-                        "cpu_pct": round(random.uniform(10.0, 45.0), 1),
-                        "memory_mb": round(random.uniform(150.0, 320.0), 1),
-                        "status": "HEALTHY",
-                        "raw_payload": {
-                            "metric": "container_cpu_usage_seconds_total",
-                            "value": round(random.uniform(1.2, 3.8), 2),
-                            "labels": {
-                                "pod": "esp-traffic-camera-abcde-fgh",
-                                "namespace": "town-traffic"
-                            }
-                        }
-                    }
-                    polled_data.append(normalized_msg)
-                
         return polled_data
+

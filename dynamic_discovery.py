@@ -28,7 +28,7 @@ class ClusterDiscoveryEngine:
 
     def generate_suffix(self) -> str:
         chars = 'abcdefghijklmnopqrstuvwxyz0123456789'
-        return f"{''.join(random.choice(chars) for _ in range(5))}-{''.join(random.choice(chars) for _ in range(3))}"
+        return f"{''.join(random.choice(chars) for _ in range(9))}-{''.join(random.choice(chars) for _ in range(5))}"
 
     def is_infra_pod(self, name: str, namespace: str) -> bool:
         if not name or not namespace:
@@ -44,7 +44,7 @@ class ClusterDiscoveryEngine:
         infra_keywords = [
             "prometheus", "sre-kafka", "kafka", "zookeeper", "alertmanager", "node-exporter",
             "pushgateway", "kube-state-metrics", "kafka-adapter", "coredns", "kube-proxy",
-            "kube-apiserver", "kube-controller-manager", "kube-scheduler", "etcd", "kindest", "minikube"
+            "kube-apiserver", "kube-controller-manager", "kube-scheduler", "etcd", "kindest", "minikube" , "kube"
         ]
         if any(kw in name_lower for kw in infra_keywords):
             return True
@@ -68,7 +68,7 @@ class ClusterDiscoveryEngine:
             res = subprocess.run(cmd, capture_output=True, text=True, timeout=2)
             if res.returncode != 0:
                 # Fallback to standard kubectl get pods if go-template is not fully available
-                cmd = ["kubectl", "get", "pods"]
+                cmd = ["kubectl", "get", "pods", "-A", "--no-headers"]
                 res = subprocess.run(cmd, capture_output=True, text=True, timeout=2)
                 if res.returncode != 0:
                     return []
@@ -82,12 +82,13 @@ class ClusterDiscoveryEngine:
                         ns, name, status = parts[0], parts[1], parts[2]
                         if self.is_infra_pod(name, ns):
                             continue
-                        containers.append({
-                            "id": name,
-                            "name": name,
-                            "image": "k8s-image:latest",
-                            "status": status
-                        })
+                        if(status=="Running"):
+                            containers.append({
+                                "id": name,
+                                "name": name,
+                                "image": "k8s-image:latest",
+                                "status": status
+                            })
                 return containers
 
             containers = []
@@ -100,12 +101,13 @@ class ClusterDiscoveryEngine:
                     ns, name, image, status = parts[0], parts[1], parts[2], parts[3]
                     if self.is_infra_pod(name, ns):
                         continue
-                    containers.append({
-                        "id": name,
-                        "name": name,
-                        "image": image.rstrip(","),
-                        "status": status
-                    })
+                    if(status=="Running"):
+                        containers.append({
+                            "id": name,
+                            "name": name,
+                            "image": image.rstrip(","),
+                            "status": status
+                        })
             return containers
         except Exception:
             return []
