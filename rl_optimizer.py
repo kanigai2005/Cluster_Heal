@@ -2,18 +2,49 @@ import os
 import json
 import random
 import requests
+import sqlite3
 from typing import Dict, List, Tuple
 from config import GEMINI_API_KEY, GROQ_API_KEY, RL_LEARNING_RATE, RL_DISCOUNT_FACTOR
 
-ACTIONS = ['force_delete', 'restart', 'scale_up', 'scale_down']
+ACTIONS = ['force_delete', 'restart', 'scale_up', 'scale_down', 'do_nothing']
 
 class QLearningOptimizer:
-    def __init__(self):
+    def __init__(self, db_path: str = "sre_agent.db"):
         # State key format: {deployment}_{cpu_level}_{mem_level}
         # cpu_levels: high_cpu (>90), med_cpu (>70), ok_cpu
         # mem_levels: high_mem (>85), ok_mem
         self.q_table = {}
         self.actions = ACTIONS
+        self.db_path = db_path
+        self._init_db()
+
+    def _init_db(self):
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self.cursor = self.conn.cursor()
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS q_table (
+                state_key TEXT,
+                action TEXT,
+                q_value REAL,
+                PRIMARY KEY (state_key, action)
+            )
+        ''')
+        self.conn.commit()
+        self._load_q_table()
+
+    def _load_q_table(self):
+        self.cursor.execute("SELECT state_key, action, q_value FROM q_table")
+        rows = self.cursor.fetchall()
+        for state_key, action, q_value in rows:
+            if state_key not in self.q_table:
+                self.q_table[state_key] = {act: 0.0 for act in self.actions}
+            self.q_table[state_key][action] = q_value
+
+    def reset_q_table(self):
+        """Clears the Q-table in memory and in the SQLite database."""
+        self.q_table = {}
+        self.cursor.execute("DELETE FROM q_table")
+        self.conn.commit()
 
     def get_state_key(self, pod: Dict) -> str:
         cpu_pct = pod.get("cpu_pct", 0.0)
@@ -71,6 +102,14 @@ class QLearningOptimizer:
         # Bellman update
         new_q = old_q + RL_LEARNING_RATE * (reward + RL_DISCOUNT_FACTOR * max_next_q - old_q)
         q_vals[action] = round(new_q, 2)
+        
+        # Save to SQLite
+        self.cursor.execute('''
+            INSERT OR REPLACE INTO q_table (state_key, action, q_value) 
+            VALUES (?, ?, ?)
+        ''', (state, action, q_vals[action]))
+        self.conn.commit()
+        
         return q_vals[action]
 
 
@@ -101,6 +140,22 @@ class GroqSREAgent:
         )
         if not process_str:
             process_str = "No active internal user processes detected (Pod in " + status + " state)."
+
+        # Health check: if the pod is working fine, avoid calling Groq
+        if status in ["HEALTHY", "Running", "OK"] and cpu_pct < 70.0 and mem_pct < 80.0 and not is_anomaly:
+            # Check for suspicious processes like 'stress' or 'leak'
+            has_suspicious_process = any(
+                "stress" in p.get("command", "").lower() or "leak" in p.get("command", "").lower()
+                for p in pod.get("activeProcesses", [])
+            )
+            if not has_suspicious_process:
+                return [{
+                    "rank": 1,
+                    "action": "do_nothing",
+                    "reason": "Pod is healthy and operating within normal parameters. No remediation required.",
+                    "kubectl_command": "N/A",
+                    "impact": "low"
+                }]
 
         prompt = f"""
         You are an elite Autonomous Site Reliability Engineer (SRE). Analyze the following production pod state alert and internal process list to generate a structured remediation prescription.

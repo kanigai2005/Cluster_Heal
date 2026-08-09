@@ -472,6 +472,9 @@ def execute_remediation(pod_name: str, action: str, triggered_by: str = "MANUAL"
         pod["memory_mb"] = 35.0
         pod["status"] = "HEALTHY"
         pod["activeProcesses"] = [{"pid": random.randint(100, 999), "user": "app", "cpu": 1.2, "mem": 2.5, "command": f"{pod['deployment']}-service"}]
+    elif q_act == "do_nothing":
+        api_log = f"No action taken for {pod['name']} as it is operating normally."
+        message = "Pod is healthy. No remediation applied."
 
     # Clear discovery cache & immediately scrape fresh state
     st.session_state.discovery_engine.clear_cache()
@@ -605,7 +608,7 @@ def purge_simulator_state():
     st.session_state.total_steps = 0
     st.session_state.ai_queries_count = 0
     st.session_state.auto_remediation_enabled = False
-    st.session_state.rl_optimizer.q_table = {}
+    st.session_state.rl_optimizer.reset_q_table()
     st.session_state.ai_recs_cache = {}
     st.session_state.kafka_msg_log = []
     st.session_state.deleted_pods = set()
@@ -1053,7 +1056,7 @@ with tab_remediation:
             q_table_data = []
             for state_key, actions_dict in st.session_state.rl_optimizer.q_table.items():
                 row_dict = {"SRE Telemetry State": state_key}
-                for act in ['force_delete', 'restart', 'scale_up', 'scale_down']:
+                for act in ['force_delete', 'restart', 'scale_up', 'scale_down', 'do_nothing']:
                     row_dict[act] = actions_dict.get(act, 0.0)
                 q_table_data.append(row_dict)
                 
@@ -1062,9 +1065,9 @@ with tab_remediation:
                 st.dataframe(q_df, hide_index=True, width='stretch', height=220)
             else:
                 sample_states = [
-                    {"SRE Telemetry State": "water_high_cpu_ok_mem", "force_delete": 8.0, "restart": 6.0, "scale_up": 12.0, "scale_down": -5.0},
-                    {"SRE Telemetry State": "kitchen_med_cpu_high_mem", "force_delete": 12.0, "restart": 12.0, "scale_up": 4.0, "scale_down": -5.0},
-                    {"SRE Telemetry State": "traffic_ok_cpu_ok_mem", "force_delete": 10.0, "restart": 8.0, "scale_up": 2.0, "scale_down": 2.0}
+                    {"SRE Telemetry State": "water_high_cpu_ok_mem", "force_delete": 8.0, "restart": 6.0, "scale_up": 12.0, "scale_down": -5.0, "do_nothing": 0.0},
+                    {"SRE Telemetry State": "kitchen_med_cpu_high_mem", "force_delete": 12.0, "restart": 12.0, "scale_up": 4.0, "scale_down": -5.0, "do_nothing": 0.0},
+                    {"SRE Telemetry State": "traffic_ok_cpu_ok_mem", "force_delete": 10.0, "restart": 8.0, "scale_up": 2.0, "scale_down": 2.0, "do_nothing": 10.0}
                 ]
                 q_df = pd.DataFrame(sample_states)
                 st.dataframe(q_df, hide_index=True, width='stretch', height=180)
@@ -1154,7 +1157,7 @@ with tab_rl:
         q_table_data = []
         for state_key, actions_dict in st.session_state.rl_optimizer.q_table.items():
             row_dict = {"SRE Telemetry State": state_key}
-            for act in ['force_delete', 'restart', 'scale_up', 'scale_down']:
+            for act in ['force_delete', 'restart', 'scale_up', 'scale_down', 'do_nothing']:
                 row_dict[act] = actions_dict.get(act, 0.0)
             q_table_data.append(row_dict)
             
@@ -1163,9 +1166,9 @@ with tab_rl:
             st.dataframe(q_df, hide_index=True, width='stretch', height=220)
         else:
             sample_states = [
-                {"SRE Telemetry State": "water_high_cpu_ok_mem", "force_delete": 8.0, "restart": 6.0, "scale_up": 12.0, "scale_down": -5.0},
-                {"SRE Telemetry State": "kitchen_med_cpu_high_mem", "force_delete": 12.0, "restart": 12.0, "scale_up": 4.0, "scale_down": -5.0},
-                {"SRE Telemetry State": "traffic_ok_cpu_ok_mem", "force_delete": 10.0, "restart": 8.0, "scale_up": 2.0, "scale_down": 2.0}
+                {"SRE Telemetry State": "water_high_cpu_ok_mem", "force_delete": 8.0, "restart": 6.0, "scale_up": 12.0, "scale_down": -5.0, "do_nothing": 0.0},
+                {"SRE Telemetry State": "kitchen_med_cpu_high_mem", "force_delete": 12.0, "restart": 12.0, "scale_up": 4.0, "scale_down": -5.0, "do_nothing": 0.0},
+                {"SRE Telemetry State": "traffic_ok_cpu_ok_mem", "force_delete": 10.0, "restart": 8.0, "scale_up": 2.0, "scale_down": 2.0, "do_nothing": 10.0}
             ]
             q_df = pd.DataFrame(sample_states)
             st.dataframe(q_df, hide_index=True, width='stretch', height=180)

@@ -3,7 +3,8 @@ import random
 import os
 import sys
 import subprocess
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
+from typing import Tuple
 
 # Try to import and setup the real Kubernetes Python Client
 try:
@@ -610,7 +611,7 @@ class KubernetesClientSimulator:
         timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ")
         api_log = f"[{timestamp}] DELETE /api/v1/namespaces/{namespace}/pods/{pod_name} (gracePeriodSeconds=0 --force)"
         
-        target_pod = next((p for p in self.pods if p["name"] == pod_name), None)
+        target_pod = next((p for p in self.get_active_pods() if p["name"] == pod_name), None)
         dep_name = target_pod.get("deployment") if target_pod else None
         
         self.deleted_pod_names.add(pod_name)
