@@ -3,7 +3,6 @@
 Welcome to the **Site Reliability Engineering (SRE) Autonomous Agent & Reinforcement Learning Portal**. This project is an advanced, high-fidelity interactive simulation and demonstration desk designed to bridge the gap between traditional SRE observability and **autonomous, self-healing closed-loop orchestration** using Machine Learning and AI.
 
 demo video = https://drive.google.com/file/d/16NTmEjZWg7LVvfEZ0RcxtsehvWcQLkdc/view?usp=sharing
----
 
 ## 🏗️ 1. Why this Project Matters: The Role of Kubernetes vs. SRE AI Agents
 
