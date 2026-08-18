@@ -4,7 +4,7 @@ import random
 import requests
 import sqlite3
 from typing import Dict, List, Tuple
-from config import GEMINI_API_KEY, GROQ_API_KEY, RL_LEARNING_RATE, RL_DISCOUNT_FACTOR
+from config import GROQ_API_KEY, RL_LEARNING_RATE, RL_DISCOUNT_FACTOR
 
 ACTIONS = ['force_delete', 'restart', 'scale_up', 'scale_down', 'do_nothing']
 
@@ -172,12 +172,15 @@ class GroqSREAgent:
         [INTERNAL CONTAINER PROCESSES (ps aux)]
         {process_str}
 
+        refer Q table for past analysis choose the best action
+        {self.q_table}
+
         Formulate 1 to 3 technical recommendations based on the pod's status and internal processes.
         Provide the response in raw JSON adhering to this schema:
         An array of objects, each containing:
         {{
           "rank": number (1, 2, or 3),
-          "action": string (MUST be one of: "force_delete", "restart", "scale_up", "scale_down"),
+          "action": string (MUST be one of: "force_delete", "restart", "scale_up", "scale_down","deleting or restarting any other process which is causing an issue inside the container"),
           "reason": string (a concise, detailed technical explanation analyzing the process/state, max 150 chars),
           "kubectl_command": string (exact kubectl command, e.g. "kubectl scale deployment {pod['deployment']} --replicas=3 -n {pod['namespace']}"),
           "impact": string ("high", "medium", or "low")
@@ -309,4 +312,3 @@ class GroqSREAgent:
             
         return enriched
 
-GeminiSREAgent = GroqSREAgent
